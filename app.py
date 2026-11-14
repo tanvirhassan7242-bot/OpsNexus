@@ -110,6 +110,35 @@ REPORT_META = [
     ('activity_report', '🕒', 'Activity Log Report', 'Everything that happened in the system during a month'),
 ]
 
+
+# ---------------------------------------------------------------------------
+# RECYCLE BIN (HR only): every deleted user / member / requisition is kept here
+# with full details and who deleted it.
+# ---------------------------------------------------------------------------
+def recycle_ensure(conn):
+    conn.execute("""CREATE TABLE IF NOT EXISTS recycle_bin (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        item_type TEXT NOT NULL,
+        item_ref INTEGER,
+        item_title TEXT,
+        item_data TEXT,
+        deleted_by_name TEXT,
+        deleted_by_role TEXT,
+        deleted_by_uid TEXT,
+        deleted_by_email TEXT,
+        deleted_at TEXT
+    )""")
+
+def recycle_add(conn, item_type, item_ref, title, data):
+    """Store a snapshot of a deleted record. `data` is a dict (never include password hashes)."""
+    recycle_ensure(conn)
+    now = _DT.now(_TZ(_TD(hours=6))).strftime('%Y-%m-%d %H:%M:%S')
+    conn.execute(
+        "INSERT INTO recycle_bin (item_type,item_ref,item_title,item_data,deleted_by_name,deleted_by_role,deleted_by_uid,deleted_by_email,deleted_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        (item_type, item_ref, title, json.dumps(data, ensure_ascii=False, default=str),
+         session.get('name') or '', session.get('role') or '', session.get('user_id') or '',
+         session.get('user') or '', now))
+
 def column_exists(cursor, table, column):
     return any(row[1] == column for row in cursor.execute(f"PRAGMA table_info({table})").fetchall())
 
@@ -269,6 +298,16 @@ THEMES = {
     'charcoal': _t('Charcoal Amber', 'Neutral black with amber',     True,  '#121212', '#1c1c1e', '#252528', '#333336', '#46464a', '#f4f4f5', '#d4d4d8', '#a1a1aa', '#f59e0b', '#d97706', '#3a2e12', '#0d0d0e', onaccent='#111111'),
     'forest':   _t('Deep Forest',    'Dark mode with forest green',  True,  '#0c1511', '#12201a', '#182a22', '#234034', '#2f5543', '#e6f4ec', '#c4dccf', '#86a898', '#22c55e', '#16a34a', '#14352a', '#08110d', onaccent='#052e16'),
     'aurora':   _t('Aurora Night',   'Dark mode with purple glow',   True,  '#120d1f', '#1a1330', '#221a3d', '#34285a', '#473a75', '#f0eafc', '#d6cdf0', '#a699c9', '#a855f7', '#9333ea', '#2d1f52', '#0e0a1a'),
+    'indigo':   _t('Indigo Classic',  'Professional indigo & white',    False, '#f5f6ff', '#ffffff', '#f8f9ff', '#e0e3fa', '#c7cbf0', '#1e2142', '#3f4373', '#6b6f99', '#4f46e5', '#4338ca', '#e0e7ff', '#312e81'),
+    'teal':     _t('Teal Corporate',  'Calm business teal',             False, '#f2f8f8', '#ffffff', '#f6fbfb', '#d5e7e8', '#b6d3d5', '#0f2a2e', '#35565a', '#668084', '#0f766e', '#115e59', '#ccfbf1', '#134e4a'),
+    'sand':     _t('Desert Sand',     'Warm beige with copper accent',  False, '#faf6ef', '#fffdf9', '#fbf7f0', '#eadfcb', '#d9c8a8', '#2b2418', '#5a4d38', '#8a7b62', '#b45309', '#92400e', '#fdebc8', '#78350f'),
+    'slate':    _t('Cool Slate',      'Minimal grey, executive look',   False, '#eef1f5', '#ffffff', '#f4f6f9', '#d9dee6', '#bcc4d1', '#111827', '#374151', '#6b7280', '#334155', '#1e293b', '#e2e8f0', '#0f172a'),
+    'orchid':   _t('Orchid Pink',     'Vibrant fuchsia on light',       False, '#fdf4ff', '#ffffff', '#fef7ff', '#f3d9fa', '#e9b8f5', '#2a1033', '#5b3a66', '#8b6a96', '#c026d3', '#a21caf', '#fae8ff', '#701a75'),
+    'obsidian': _t('Obsidian Black',  'Pure black with cyan accent',    True,  '#050505', '#0d0d0f', '#151518', '#26262b', '#3a3a41', '#f5f5f7', '#d1d1d6', '#8e8e96', '#06b6d4', '#0891b2', '#0c2f38', '#000000', onaccent='#04181c'),
+    'deepsea':  _t('Deep Sea',        'Dark ocean teal',                True,  '#07181c', '#0c2329', '#112e35', '#1c4650', '#28606c', '#e3f5f7', '#bcdfe3', '#7fa9b0', '#14b8a6', '#0d9488', '#0f3d3b', '#04100f', onaccent='#031a17'),
+    'crimson':  _t('Crimson Night',   'Dark mode with red highlights',  True,  '#150a0c', '#1f1013', '#29161a', '#43232a', '#5c3039', '#fbeaec', '#e6c3c8', '#b08a90', '#ef4444', '#dc2626', '#3d1519', '#0d0507'),
+    'espresso': _t('Espresso Copper', 'Dark coffee with copper tone',   True,  '#140f0b', '#1e1712', '#281f18', '#3d3025', '#54432f', '#f6efe7', '#dccdb9', '#a8967f', '#d6a05a', '#c28a40', '#3a2b17', '#0c0805', onaccent='#1a1006'),
+    'nord':     _t('Nordic Frost',    'Cool arctic dark palette',       True,  '#242933', '#2e3440', '#353c4a', '#434c5e', '#556079', '#eceff4', '#d8dee9', '#9aa5b8', '#88c0d0', '#6fb0c2', '#3b4a56', '#1c2028', onaccent='#1b2630'),
 }
 
 def _inl(props, vals):
@@ -518,6 +557,8 @@ BASE_TEMPLATE = '''
         /* Dashboard Metric Cards */
         .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; margin-bottom: 25px; }
         .metric-card { background: #ffffff; padding: 20px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); border: 1px solid #e2e8f0; display: flex; align-items: center; gap: 15px; }
+        a.metric-card { text-decoration: none; color: inherit; cursor: pointer; transition: transform .2s ease, box-shadow .2s ease, border-color .2s ease; }
+        a.metric-card:hover { transform: translateY(-3px); box-shadow: 0 10px 22px rgba(15,23,42,.14); border-color: var(--t-accent, #2563eb); }
         .metric-icon { width: 48px; height: 48px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 22px; }
         .metric-info h3 { margin: 0 0 5px 0; font-size: 11px; color: #64748b; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase; }
         .metric-info .val { font-size: 22px; font-weight: bold; color: #1e293b; }
@@ -540,23 +581,19 @@ BASE_TEMPLATE = '''
         .badge-approved { background: #dcfce7; color: #16a34a; }
         .badge-rejected { background: #fee2e2; color: #dc2626; }
         
-        .login-body { display: flex; justify-content: center; align-items: center; height: 100vh; background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); margin: 0; position: relative; overflow: hidden; }
-        .login-card { background: white; padding: 40px; border-radius: 12px; width: 100%; max-width: 400px; box-shadow: 0 10px 25px rgba(0,0,0,0.3); text-align: center; position: relative; z-index: 2; }
+        .login-body { display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; position: relative; overflow: hidden;
+            background: radial-gradient(900px 520px at 12% 8%, rgba(37,99,235,.30), transparent 62%), radial-gradient(820px 520px at 92% 92%, rgba(6,182,212,.20), transparent 62%), linear-gradient(135deg, #0b1220 0%, #0f172a 55%, #111c33 100%); }
+        .login-card { background: white; padding: 40px; border-radius: 16px; width: 100%; max-width: 400px; border: 1px solid rgba(255,255,255,.10); box-shadow: 0 30px 70px -15px rgba(0,0,0,.65), 0 0 0 1px rgba(255,255,255,.04); text-align: center; position: relative; z-index: 2; }
 
-        /* Login background: blurred floating 3D logos */
-        .logo-bg { position: absolute; inset: 0; overflow: hidden; pointer-events: none; z-index: 0; perspective: 900px; perspective-origin: 50% 50%; }
-        .logo-bg .fl { position: absolute; left: var(--x); top: var(--y); width: var(--s); height: var(--s); filter: blur(var(--b)); opacity: var(--o); transform-style: preserve-3d; will-change: transform; animation: flFloat var(--d) ease-in-out var(--dl) infinite alternate; }
-        .logo-bg .fl svg { width: 100%; height: 100%; display: block; animation: flSpin var(--r) linear var(--dl) infinite; transform-style: preserve-3d; }
-        @keyframes flFloat {
-            0%   { transform: translate3d(0, 0, 0) rotateZ(-8deg); }
-            50%  { transform: translate3d(calc(var(--dx) * .5), calc(var(--dy) * -1), var(--dz)) rotateZ(6deg); }
-            100% { transform: translate3d(var(--dx), var(--dy), calc(var(--dz) * -1)) rotateZ(-4deg); }
-        }
-        @keyframes flSpin {
-            0%   { transform: rotateX(18deg) rotateY(0deg); }
-            100% { transform: rotateX(18deg) rotateY(360deg); }
-        }
-        @media (prefers-reduced-motion: reduce) { .logo-bg .fl, .logo-bg .fl svg { animation: none; } }
+        /* Login: professional dark backdrop */
+        .login-body::before { content: ""; position: absolute; inset: 0; pointer-events: none; z-index: 0;
+            background-image: linear-gradient(rgba(148,163,184,.07) 1px, transparent 1px), linear-gradient(90deg, rgba(148,163,184,.07) 1px, transparent 1px);
+            background-size: 56px 56px;
+            -webkit-mask-image: radial-gradient(ellipse at center, #000 20%, transparent 72%); mask-image: radial-gradient(ellipse at center, #000 20%, transparent 72%); }
+        .login-card input:not([type=checkbox]) { transition: border-color .2s, box-shadow .2s; }
+        .login-card input:not([type=checkbox]):focus { outline: none; border-color: #2563eb !important; box-shadow: 0 0 0 3px rgba(37,99,235,.18); }
+        .login-card button[type=submit] { background: linear-gradient(135deg, #2563eb, #1d4ed8); box-shadow: 0 6px 14px -4px rgba(37,99,235,.55); font-weight: 600; letter-spacing: .3px; }
+        .login-card button[type=submit]:hover { background: linear-gradient(135deg, #3b82f6, #2563eb); }
         .error { color: #dc2626; font-size: 13px; margin-bottom: 15px; }
         
         /* Table Row Dropdown Fix */
@@ -802,37 +839,6 @@ def login():
             
     body_content = '''
     <div class="login-body">
-        <div class="logo-bg" aria-hidden="true">
-            <svg width="0" height="0" style="position:absolute" aria-hidden="true">
-                <defs>
-                    <linearGradient id="bgLogoGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-                        <stop offset="0%" stop-color="#2563EB" />
-                        <stop offset="100%" stop-color="#06B6D4" />
-                    </linearGradient>
-                    <symbol id="bgLogoSym" viewBox="0 0 48 48">
-                <path d="M24 4L40 13.24V34.76L24 44L8 34.76V13.24L24 4Z" fill="url(#bgLogoGrad)" opacity="0.25" />
-                <path d="M24 8L36 15V33L24 40L12 33V15L24 8Z" stroke="url(#bgLogoGrad)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />
-                <circle cx="24" cy="24" r="5" fill="url(#bgLogoGrad)" />
-                <circle cx="24" cy="12" r="3" fill="#2563EB" />
-                <circle cx="34" cy="30" r="3" fill="#06B6D4" />
-                <circle cx="14" cy="30" r="3" fill="#2563EB" />
-                <path d="M24 15V19" stroke="url(#bgLogoGrad)" stroke-width="2.5" stroke-linecap="round" />
-                <path d="M28 26.5L32 28.5" stroke="url(#bgLogoGrad)" stroke-width="2.5" stroke-linecap="round" />
-                <path d="M20 26.5L16 28.5" stroke="url(#bgLogoGrad)" stroke-width="2.5" stroke-linecap="round" />
-                    </symbol>
-                </defs>
-            </svg>
-            <div class="fl" style="--x:6%;--y:10%;--s:110px;--b:3px;--o:.55;--d:14s;--r:22s;--dl:-2s;--dx:80px;--dy:60px;--dz:120px;"><svg viewBox="0 0 48 48" fill="none"><use href="#bgLogoSym"/></svg></div>
-            <div class="fl" style="--x:78%;--y:8%;--s:170px;--b:6px;--o:.40;--d:18s;--r:30s;--dl:-6s;--dx:-90px;--dy:80px;--dz:-80px;"><svg viewBox="0 0 48 48" fill="none"><use href="#bgLogoSym"/></svg></div>
-            <div class="fl" style="--x:44%;--y:4%;--s:70px;--b:1.5px;--o:.65;--d:11s;--r:18s;--dl:-4s;--dx:60px;--dy:90px;--dz:160px;"><svg viewBox="0 0 48 48" fill="none"><use href="#bgLogoSym"/></svg></div>
-            <div class="fl" style="--x:88%;--y:46%;--s:90px;--b:2px;--o:.60;--d:13s;--r:20s;--dl:-9s;--dx:-70px;--dy:-60px;--dz:140px;"><svg viewBox="0 0 48 48" fill="none"><use href="#bgLogoSym"/></svg></div>
-            <div class="fl" style="--x:4%;--y:55%;--s:190px;--b:8px;--o:.35;--d:20s;--r:34s;--dl:-3s;--dx:90px;--dy:-70px;--dz:-100px;"><svg viewBox="0 0 48 48" fill="none"><use href="#bgLogoSym"/></svg></div>
-            <div class="fl" style="--x:62%;--y:70%;--s:130px;--b:4px;--o:.50;--d:16s;--r:26s;--dl:-7s;--dx:-80px;--dy:-50px;--dz:110px;"><svg viewBox="0 0 48 48" fill="none"><use href="#bgLogoSym"/></svg></div>
-            <div class="fl" style="--x:22%;--y:78%;--s:80px;--b:2px;--o:.60;--d:12s;--r:19s;--dl:-5s;--dx:70px;--dy:-80px;--dz:150px;"><svg viewBox="0 0 48 48" fill="none"><use href="#bgLogoSym"/></svg></div>
-            <div class="fl" style="--x:92%;--y:84%;--s:60px;--b:1px;--o:.70;--d:10s;--r:16s;--dl:-1s;--dx:-50px;--dy:-60px;--dz:180px;"><svg viewBox="0 0 48 48" fill="none"><use href="#bgLogoSym"/></svg></div>
-            <div class="fl" style="--x:34%;--y:30%;--s:55px;--b:1px;--o:.55;--d:9s;--r:15s;--dl:-8s;--dx:90px;--dy:50px;--dz:200px;"><svg viewBox="0 0 48 48" fill="none"><use href="#bgLogoSym"/></svg></div>
-            <div class="fl" style="--x:70%;--y:24%;--s:75px;--b:2px;--o:.55;--d:15s;--r:24s;--dl:-10s;--dx:-60px;--dy:70px;--dz:130px;"><svg viewBox="0 0 48 48" fill="none"><use href="#bgLogoSym"/></svg></div>
-        </div>
         <div class="login-card">
             <h2 class="brand-anim" style="color: #1e293b; margin: 0 0 24px; font-size: 28px; letter-spacing: 1px;">OpsNexus</h2>
             ''' + (f'<div class="error">{error}</div>' if error else '') + '''
@@ -1598,6 +1604,11 @@ def dashboard():
         """
 
     content_area = ""
+    _can_reports = role in ('Admin', 'HR')
+    lnk_members = '/dashboard?tab=employees'
+    lnk_balance = '/report/balance_report' if _can_reports else '/dashboard?tab=employees'
+    lnk_used = '/report/mobile_bill' if _can_reports else '/dashboard?tab=employees'
+    lnk_reqs = '/dashboard?tab=requisitions'
     if tab == 'overview':
         chart_js = """
         <script>
@@ -1638,34 +1649,34 @@ def dashboard():
         </div>
 
         <div class="metrics-grid">
-            <div class="metric-card">
+            <a class="metric-card" href="'''+ lnk_members +'''" title="Open details">
                 <div class="metric-icon" style="background: #eff6ff; color: #2563EB;">👥</div>
                 <div class="metric-info">
                     <h3>TOTAL MEMBERS</h3>
                     <div class="val">''' + str(total_employees) + '''</div>
                 </div>
-            </div>
-            <div class="metric-card">
+            </a>
+            <a class="metric-card" href="'''+ lnk_balance +'''" title="Open details">
                 <div class="metric-icon" style="background: #dcfce7; color: #10b981;">💰</div>
                 <div class="metric-info">
                     <h3>TOTAL CURRENT BALANCE</h3>
                     <div class="val" style="color: #10b981;">৳''' + str(total_balance) + '''</div>
                 </div>
-            </div>
-            <div class="metric-card">
+            </a>
+            <a class="metric-card" href="'''+ lnk_used +'''" title="Open details">
                 <div class="metric-icon" style="background: #eff6ff; color: #2563EB;">⚡</div>
                 <div class="metric-info">
                     <h3>TOTAL USED / RECHARGED</h3>
                     <div class="val" style="color: #2563EB;">৳''' + str(total_used) + '''</div>
                 </div>
-            </div>
-            <div class="metric-card">
+            </a>
+            <a class="metric-card" href="'''+ lnk_reqs +'''" title="Open details">
                 <div class="metric-icon" style="background: #fef3c7; color: #f59e0b;">📋</div>
                 <div class="metric-info">
                     <h3>OFFICE REQUISITIONS</h3>
                     <div class="val" style="color: #f59e0b;">''' + str(total_requisitions) + '''</div>
                 </div>
-            </div>
+            </a>
         </div>
         
         <div class="panel">
@@ -2387,6 +2398,108 @@ def dashboard():
             }});
             document.addEventListener('keydown',function(e){{if(e.key==='Escape'){{closeUserModal();closeEditUser();}}}});
             </script>'''
+    elif tab == 'recycle':
+        if role != 'HR':
+            content_area = '<div class="panel"><h3>Access denied</h3><p>Only HR can open the Recycle Bin.</p></div>'
+        else:
+            rb_conn = sqlite3.connect(DB_NAME)
+            rb_conn.row_factory = sqlite3.Row
+            recycle_ensure(rb_conn)
+            rb_rows = rb_conn.execute("SELECT * FROM recycle_bin ORDER BY id DESC").fetchall()
+            rb_conn.close()
+            type_icon = {'User': '👤', 'Member': '👥', 'Requisition': '📋'}
+            rb_html = ''
+            for r_ in rb_rows:
+                try:
+                    payload = json.loads(r_['item_data'] or '{}')
+                except ValueError:
+                    payload = {}
+                detail = {
+                    'type': r_['item_type'], 'title': r_['item_title'], 'ref': r_['item_ref'],
+                    'by_name': r_['deleted_by_name'], 'by_role': r_['deleted_by_role'],
+                    'by_uid': r_['deleted_by_uid'], 'by_email': r_['deleted_by_email'],
+                    'at': r_['deleted_at'], 'data': payload}
+                rb_html += (
+                    '<tr data-type="' + esc(r_['item_type']) + '">'
+                    '<td>' + str(r_['id']) + '</td>'
+                    '<td><span class="rb-type rb-' + esc(r_['item_type']) + '">' + type_icon.get(r_['item_type'], '🗂️') + ' ' + esc(r_['item_type']) + '</span></td>'
+                    '<td><b>' + esc(r_['item_title']) + '</b></td>'
+                    '<td>#' + esc(r_['item_ref']) + '</td>'
+                    '<td>' + esc(r_['deleted_by_name'] or '-') + '<div class="rb-sub">' + esc(r_['deleted_by_role'] or '') + ' &middot; ID: ' + esc(r_['deleted_by_uid'] or '-') + '</div></td>'
+                    '<td>' + esc(r_['deleted_at']) + '</td>'
+                    '<td><button type="button" class="rb-view" data-detail="' + esc(json.dumps(detail, ensure_ascii=False)) + '" onclick="rbOpen(this)">View details</button></td>'
+                    '</tr>')
+            if not rb_html:
+                rb_html = '<tr><td colspan="7" style="text-align:center;padding:30px;color:#64748b">Recycle Bin is empty. Deleted users, members and requisitions will appear here.</td></tr>'
+            content_area = """<style>
+            .rb-card{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:22px}
+            .rb-table{width:100%;border-collapse:collapse;font-size:13px}
+            .rb-table th,.rb-table td{padding:11px 10px;border-bottom:1px solid #e2e8f0;text-align:left;vertical-align:top}
+            .rb-sub{font-size:11px;color:#64748b;margin-top:2px}
+            .rb-type{display:inline-block;padding:3px 9px;border-radius:20px;font-size:11px;font-weight:700;background:#eff6ff;color:#1d4ed8}
+            .rb-Member{background:#dcfce7;color:#15803d}.rb-Requisition{background:#fef3c7;color:#92400e}
+            .rb-view{padding:6px 12px;font-size:12px}
+            .rb-tools{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0}
+            .rb-tools input,.rb-tools select{padding:8px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px}
+            .rb-back{position:fixed;inset:0;background:rgba(15,23,42,.55);display:none;align-items:center;justify-content:center;z-index:5000;padding:16px}
+            .rb-back.show{display:flex}
+            .rb-modal{background:#fff;border-radius:12px;width:100%;max-width:640px;max-height:88vh;overflow:auto;box-shadow:0 20px 50px rgba(0,0,0,.35)}
+            .rb-mh{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid #e2e8f0}
+            .rb-mh h3{margin:0;font-size:17px}.rb-x{background:transparent!important;color:#64748b!important;font-size:22px;padding:0 6px}
+            .rb-mb{padding:18px 20px}.rb-sec{font-size:12px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:#64748b;margin:16px 0 8px}
+            .rb-kv{width:100%;border-collapse:collapse;font-size:13px}.rb-kv td{padding:8px 6px;border-bottom:1px solid #f1f5f9;vertical-align:top}
+            .rb-kv td:first-child{width:38%;color:#64748b;font-weight:600}
+            .rb-del{background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:4px 10px}
+            </style>
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:18px">
+              <span style="font-size:26px">🗑️</span>
+              <div><h2 style="margin:0;color:#1e293b">Recycle Bin</h2>
+              <p style="margin:3px 0 0;color:#64748b;font-size:13px">Everything deleted from the system, with who deleted it. Visible to HR only.</p></div>
+            </div>
+            <div class="rb-card">
+              <div class="rb-tools">
+                <input type="search" id="rbSearch" placeholder="Search name, ID, deleted by..." oninput="rbFilter()" style="min-width:240px">
+                <select id="rbType" onchange="rbFilter()"><option value="">All types</option><option>User</option><option>Member</option><option>Requisition</option></select>
+                <b style="margin-left:auto;align-self:center;font-size:12px;color:#64748b">""" + str(len(rb_rows)) + """ item(s)</b>
+              </div>
+              <div style="overflow-x:auto"><table class="rb-table">
+                <thead><tr><th>#</th><th>Type</th><th>Deleted item</th><th>Original ID</th><th>Deleted by</th><th>Deleted at</th><th></th></tr></thead>
+                <tbody id="rbBody">""" + rb_html + """</tbody>
+              </table></div>
+            </div>
+            <div class="rb-back" id="rbBack"><div class="rb-modal">
+              <div class="rb-mh"><h3 id="rbTitle">Details</h3><button type="button" class="rb-x" onclick="rbClose()">&times;</button></div>
+              <div class="rb-mb" id="rbBodyM"></div>
+            </div></div>
+            <script>
+            function rbEsc(v){var d=document.createElement('div');d.textContent=(v===null||v===undefined||v==='')?'-':String(v);return d.innerHTML;}
+            function rbLabel(k){return k.replace(/_/g,' ').replace(/\\b\\w/g,function(c){return c.toUpperCase();});}
+            function rbOpen(btn){
+              var d=JSON.parse(btn.getAttribute('data-detail'));
+              document.getElementById('rbTitle').textContent=d.type+' deleted: '+d.title;
+              var h='<div class="rb-sec">Deleted by</div><table class="rb-kv">'
+                +'<tr><td>Name</td><td>'+rbEsc(d.by_name)+'</td></tr>'
+                +'<tr><td>Role</td><td>'+rbEsc(d.by_role)+'</td></tr>'
+                +'<tr><td>Login ID used</td><td>'+rbEsc(d.by_uid)+'</td></tr>'
+                +'<tr><td>Email</td><td>'+rbEsc(d.by_email)+'</td></tr>'
+                +'<tr><td>Deleted at</td><td>'+rbEsc(d.at)+'</td></tr></table>';
+              h+='<div class="rb-sec">Deleted '+rbEsc(d.type)+' (original ID #'+rbEsc(d.ref)+')</div><table class="rb-kv">';
+              Object.keys(d.data||{}).forEach(function(k){h+='<tr><td>'+rbEsc(rbLabel(k))+'</td><td>'+rbEsc(d.data[k])+'</td></tr>';});
+              h+='</table>';
+              document.getElementById('rbBodyM').innerHTML=h;
+              document.getElementById('rbBack').classList.add('show');
+            }
+            function rbClose(){document.getElementById('rbBack').classList.remove('show');}
+            document.getElementById('rbBack').addEventListener('click',function(e){if(e.target===this)rbClose();});
+            document.addEventListener('keydown',function(e){if(e.key==='Escape')rbClose();});
+            function rbFilter(){
+              var q=document.getElementById('rbSearch').value.toLowerCase(),t=document.getElementById('rbType').value;
+              document.querySelectorAll('#rbBody tr').forEach(function(tr){
+                var okT=!t||tr.getAttribute('data-type')===t, okQ=!q||tr.textContent.toLowerCase().indexOf(q)>-1;
+                tr.style.display=(okT&&okQ)?'':'none';
+              });
+            }
+            </script>"""
     elif tab == 'profile':
         role_input_html = f'''
             <select name="role">
@@ -2548,6 +2661,17 @@ def dashboard():
         </div>'''
 
     notif_bell_html = HR_BELL_HTML if role == 'HR' else ''
+    if role == 'HR':
+        try:
+            _rc = sqlite3.connect(DB_NAME)
+            recycle_ensure(_rc)
+            _bin_count = _rc.execute("SELECT COUNT(*) FROM recycle_bin").fetchone()[0]
+            _rc.close()
+        except sqlite3.Error:
+            _bin_count = 0
+        notif_bell_html = ('<a href="/dashboard?tab=recycle" class="notif-bell recycle-link" id="recycleBtn" title="Recycle Bin (' + str(_bin_count) + ')" aria-label="Recycle Bin" style="text-decoration:none;margin-right:10px;">'
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>'
+            + ('<span class="notif-badge show" style="background:#64748b">' + (str(_bin_count) if _bin_count < 100 else '99+') + '</span>' if _bin_count else '') + '</a>') + notif_bell_html
     body_content = f'''
     <div class="top-header">
         {brand_logo_html}
@@ -2713,7 +2837,9 @@ def delete_user(user_id):
     if not session.get('logged_in') or actor_role not in ('Admin', 'HR'):
         return redirect(url_for('login'))
     conn = sqlite3.connect(DB_NAME)
-    target = conn.execute("SELECT role,email,user_id FROM app_users WHERE id=?", (user_id,)).fetchone()
+    conn.row_factory = sqlite3.Row
+    full_row = conn.execute("SELECT * FROM app_users WHERE id=?", (user_id,)).fetchone()
+    target = (full_row['role'], full_row['email'], full_row['user_id']) if full_row else None
     if not target:
         conn.close()
         return redirect(url_for('dashboard', tab='users', success_msg='User not found.'))
@@ -2730,6 +2856,8 @@ def delete_user(user_id):
     if not is_full() and t_role != 'Member':
         conn.close()
         return redirect(url_for('dashboard', tab='users', success_msg='HR can delete Member accounts only.'))
+    snap = {k: full_row[k] for k in full_row.keys() if k != 'password_hash'}
+    recycle_add(conn, 'User', user_id, f"{full_row['full_name']} ({t_uid})", snap)
     conn.execute("DELETE FROM app_users WHERE id=?", (user_id,))
     conn.execute("INSERT INTO activity_logs (action) VALUES (?)", (f"{actor_role} deleted user account {t_uid} (ID {user_id})",))
     conn.commit()
@@ -2857,6 +2985,7 @@ def delete_member(emp_id):
     emp = conn.execute("SELECT * FROM employees WHERE id = ?", (emp_id,)).fetchone()
     
     if emp:
+        recycle_add(conn, 'Member', emp['id'], emp['name'], dict(emp))
         conn.execute("DELETE FROM employees WHERE id = ?", (emp_id,))
         conn.execute("INSERT INTO activity_logs (action) VALUES (?)", (f"Deleted member: {emp['name']}",))
         conn.commit()
@@ -2875,7 +3004,10 @@ def bulk_delete_members():
     emp_ids = request.form.getlist('emp_ids')
     if emp_ids:
         conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
         placeholders = ', '.join(['?'] * len(emp_ids))
+        for _r in conn.execute(f"SELECT * FROM employees WHERE id IN ({placeholders})", emp_ids).fetchall():
+            recycle_add(conn, 'Member', _r['id'], _r['name'], dict(_r))
         conn.execute(f"DELETE FROM employees WHERE id IN ({placeholders})", emp_ids)
         conn.execute("INSERT INTO activity_logs (action) VALUES (?)", (f"Bulk deleted {len(emp_ids)} members",))
         conn.commit()
@@ -2890,6 +3022,10 @@ def delete_requisition(req_id):
         return redirect(url_for('login'))
     
     conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    _r = conn.execute("SELECT * FROM requisitions WHERE id = ?", (req_id,)).fetchone()
+    if _r:
+        recycle_add(conn, 'Requisition', _r['id'], f"Requisition #{_r['id']} - {_r['type']} ({_r['emp_name']})", dict(_r))
     conn.execute("DELETE FROM requisitions WHERE id = ?", (req_id,))
     conn.execute("INSERT INTO activity_logs (action) VALUES (?)", (f"Deleted requisition #{req_id}",))
     conn.commit()
@@ -2904,7 +3040,10 @@ def bulk_delete_requisitions():
     req_ids = request.form.getlist('req_ids')
     if req_ids:
         conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
         placeholders = ', '.join(['?'] * len(req_ids))
+        for _r in conn.execute(f"SELECT * FROM requisitions WHERE id IN ({placeholders})", req_ids).fetchall():
+            recycle_add(conn, 'Requisition', _r['id'], f"Requisition #{_r['id']} - {_r['type']} ({_r['emp_name']})", dict(_r))
         conn.execute(f"DELETE FROM requisitions WHERE id IN ({placeholders})", req_ids)
         conn.execute("INSERT INTO activity_logs (action) VALUES (?)", (f"Bulk deleted {len(req_ids)} requisitions",))
         conn.commit()
