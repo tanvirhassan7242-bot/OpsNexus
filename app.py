@@ -130,11 +130,29 @@ ACCESS_DEFAULTS = {
 TAB_MODULE = {'overview': 'dashboard', 'employees': 'employees', 'requisitions': 'requisitions', 'users': 'users',
               'reports': 'reports', 'settings': 'settings', 'activity_log': 'activity_log'}
 
+# Button-level permissions: (key, module, label, roles that can be configured)
+ACCESS_ACTIONS = [
+    ('employees.add', 'employees', 'Add member', ('Admin', 'Member')),
+    ('employees.edit', 'employees', 'Edit member balance', ('Admin', 'Member')),
+    ('employees.delete', 'employees', 'Delete member(s)', ('Admin', 'Member')),
+    ('requisitions.add', 'requisitions', 'Submit requisition', ('Admin', 'Member')),
+    ('requisitions.edit', 'requisitions', 'Edit requisition', ('Admin', 'Member')),
+    ('requisitions.approve', 'requisitions', 'Approve / Reject', ('Admin', 'Member')),
+    ('requisitions.delete', 'requisitions', 'Delete requisition(s)', ('Admin', 'Member')),
+    ('users.create', 'users', 'Add user', ('Admin',)),
+    ('users.edit', 'users', 'Edit user', ('Admin',)),
+    ('users.delete', 'users', 'Delete user', ('Admin',)),
+]
+# Defaults keep the old behaviour: Admin can do everything, Member can only submit requisitions.
+for _k, _m, _l, _r in ACCESS_ACTIONS:
+    ACCESS_DEFAULTS['Admin'][_k] = 1
+    ACCESS_DEFAULTS['Member'][_k] = 1 if _k == 'requisitions.add' else 0
+
 
 def access_map(role):
     """Return {module: bool} for a role. HR always has full access."""
     if role == 'HR':
-        return {m[0]: True for m in ACCESS_MODULES}
+        return {**{m[0]: True for m in ACCESS_MODULES}, **{a[0]: True for a in ACCESS_ACTIONS}}
     res = {k: bool(v) for k, v in ACCESS_DEFAULTS.get(role, ACCESS_DEFAULTS['Member']).items()}
     try:
         c = sqlite3.connect(DB_NAME)
@@ -151,9 +169,83 @@ def module_allowed(role, module):
     return access_map(role).get(module, False)
 
 
+def can(action):
+    """Button-level permission, e.g. can('employees.delete'). HR/owner: always. Others: module ON + action ON."""
+    if not session.get('logged_in'):
+        return False
+    role = session.get('role')
+    if role == 'HR' or is_owner():
+        return True
+    m = access_map(role)
+    return bool(m.get(action.split('.')[0]) and m.get(action))
+
+
+def deny(tab='overview'):
+    if not session.get('logged_in'):
+        return redirect(url_for('login'))
+    return redirect(url_for('dashboard', tab=tab, success_msg='You do not have permission to do this action.'))
+
+
 def fund_total(conn):
     r = conn.execute("SELECT COALESCE(SUM(CASE WHEN kind='Deposit' THEN amount ELSE -amount END),0) FROM fund_transactions").fetchone()
     return int(r[0] or 0)
+
+
+def req_fund_sync(conn, req_id, approved):
+    """Keep the fund in step with a requisition.
+    approved and amount > 0  -> exactly one linked Expense entry of that amount.
+    anything else            -> the linked entry is removed (money goes back into the fund).
+    Returns (ok, message). Does not commit."""
+    cur = conn.cursor()
+    row = cur.execute("SELECT amount, type, emp_name FROM requisitions WHERE id=?", (req_id,)).fetchone()
+    if not row:
+        return True, ''
+    want = max(to_int(row[0], 0), 0) if approved else 0
+    tx = cur.execute("SELECT id, amount FROM fund_transactions WHERE req_id=?", (req_id,)).fetchone()
+    have = int(tx[1]) if tx else 0
+    sym = load_settings().get('currency_symbol', '৳')
+    if want - have > fund_total(conn):
+        return False, f"Not enough balance in the fund (available {sym}{fund_total(conn)}, {sym}{want - have} more needed)."
+    note = f"Requisition #{req_id} - {row[1]} ({row[2]})"[:200]
+    if want == 0:
+        if tx:
+            cur.execute("DELETE FROM fund_transactions WHERE id=?", (tx[0],))
+            cur.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)",
+                        (f"Fund refunded {have}: requisition #{req_id} is no longer approved", actor_name()))
+    elif tx:
+        cur.execute("UPDATE fund_transactions SET amount=?, note=? WHERE id=?", (want, note, tx[0]))
+        cur.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)",
+                    (f"Fund entry for requisition #{req_id} changed {have} -> {want}", actor_name()))
+    else:
+        cur.execute("INSERT INTO fund_transactions (kind, amount, note, created_by, req_id) VALUES ('Expense',?,?,?,?)",
+                    (want, note, actor_name(), req_id))
+        cur.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)",
+                    (f"Fund auto-spent {want} for approved requisition #{req_id}", actor_name()))
+    return True, ''
+
+
+FUND_EXTRA = """<style>
+.fund-btn{padding:5px 10px;font-size:12px;border-radius:6px;border:1px solid #cbd5e1;background:#fff;color:#334155;cursor:pointer;margin:0 3px 3px 0;white-space:nowrap}
+.fund-btn.del{color:#b91c1c;border-color:#fecaca;background:#fef2f2}
+.fund-lock{font-size:12px;color:#64748b;white-space:nowrap}
+.fund-modal{position:fixed;inset:0;background:rgba(15,23,42,.55);display:none;align-items:center;justify-content:center;z-index:5000;padding:16px}
+.fund-modal.show{display:flex}
+.fund-modal .box{background:#fff;border-radius:12px;padding:22px;width:100%;max-width:420px;box-shadow:0 20px 50px rgba(0,0,0,.35)}
+.fund-modal label{display:block;font-size:12px;font-weight:600;color:#334155;margin:10px 0 5px}
+.fund-modal input,.fund-modal select{width:100%;box-sizing:border-box;padding:10px;border:1px solid #cbd5e1;border-radius:7px}
+.fund-modal .row{display:flex;justify-content:flex-end;gap:10px;margin-top:18px}
+</style>
+<div class="fund-modal" id="fundModal"><div class="box"><h3 style="margin:0 0 4px;color:#1e293b">Edit fund entry</h3>
+<form method="POST" action="/fund/edit"><input type="hidden" name="id" id="fmId">
+<label>Type</label><select name="kind" id="fmKind"><option value="Deposit">&#10133; Add money</option><option value="Expense">&#10134; Spend / Withdraw</option></select>
+<label>Amount</label><input type="number" name="amount" id="fmAmount" min="1" required>
+<label>Note</label><input type="text" name="note" id="fmNote" maxlength="200">
+<div class="row"><button type="button" onclick="fundClose()" style="background:#64748b">Cancel</button><button type="submit">Save</button></div></form></div></div>
+<script>
+function fundEdit(b){document.getElementById('fmId').value=b.dataset.id;document.getElementById('fmKind').value=b.dataset.kind;document.getElementById('fmAmount').value=b.dataset.amount;document.getElementById('fmNote').value=b.dataset.note;document.getElementById('fundModal').classList.add('show')}
+function fundClose(){document.getElementById('fundModal').classList.remove('show')}
+function fundDel(id){if(!confirm('Delete this fund entry? It will be saved in the Recycle Bin.'))return;var f=document.createElement('form');f.method='POST';f.action='/fund/delete';var i=document.createElement('input');i.type='hidden';i.name='id';i.value=id;f.appendChild(i);document.body.appendChild(f);f.submit()}
+</script>"""
 
 
 REPORT_META = [
@@ -235,6 +327,9 @@ def init_db():
     # Reject remark column (auto-migrates old databases without losing data)
     if not column_exists(cursor, 'requisitions', 'remark'):
         cursor.execute("ALTER TABLE requisitions ADD COLUMN remark TEXT")
+    # Money asked for in the requisition (0 = no money involved). Approved + amount > 0 is taken from the fund.
+    if not column_exists(cursor, 'requisitions', 'amount'):
+        cursor.execute("ALTER TABLE requisitions ADD COLUMN amount INTEGER DEFAULT 0")
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS app_users (
@@ -331,6 +426,9 @@ def init_db():
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    # Links an automatic fund entry to the requisition that caused it
+    if not column_exists(cursor, 'fund_transactions', 'req_id'):
+        cursor.execute("ALTER TABLE fund_transactions ADD COLUMN req_id INTEGER")
     # Owner account is permanently on the HR post (no data is deleted, only the role value is set)
     cursor.execute("UPDATE app_users SET role='HR' WHERE (email=? COLLATE NOCASE OR user_id=? COLLATE NOCASE) AND role!='HR'",
                    (ADMIN_IDENTIFIER, ADMIN_IDENTIFIER))
@@ -628,6 +726,27 @@ BASE_TEMPLATE = '''
         .sidebar a { display: flex; align-items: center; justify-content: space-between; color: #475569; text-decoration: none; padding: 11px 18px; font-size: 14px; border-left: 3px solid transparent; transition: all 0.2s; }
         .sidebar a:hover, .sidebar a.active { background: #f8fafc; color: #3b82f6; border-left-color: #3b82f6; font-weight: 600; }
         .main-content { margin-left: 250px; padding: 25px; width: calc(100% - 250px); background: #f4f6f9; }
+        .nav-toggle { display: none; background: transparent; border: 0; color: #334155; font-size: 24px; line-height: 1; padding: 6px 10px; margin-right: 4px; cursor: pointer; border-radius: 8px; }
+        .nav-toggle:hover { background: #f1f5f9; }
+        .nav-backdrop { display: none; position: fixed; top: 65px; left: 0; right: 0; bottom: 0; background: rgba(15,23,42,.45); z-index: 1400; }
+        /* Mobile / tablet: sidebar becomes a slide-in drawer so the page gets the full width */
+        @media (max-width: 900px) {
+            .nav-toggle { display: inline-flex; align-items: center; }
+            .top-header { padding: 0 10px; }
+            .sidebar { transform: translateX(-100%); transition: transform .25s ease; z-index: 1500; width: 270px; max-width: 84vw; box-shadow: 8px 0 30px -12px rgba(15,23,42,.45); }
+            .sidebar.open { transform: none; }
+            .nav-backdrop.show { display: block; }
+            .main-content { margin-left: 0; width: 100%; padding: 14px; box-sizing: border-box; min-width: 0; }
+        }
+        @media (max-width: 640px) {
+            .user-meta { display: none !important; }
+            .top-header > div { gap: 8px !important; }
+            .brand-logo-container { gap: 8px; }
+            .top-header .notif-bell { width: 36px; height: 36px; }
+        }
+        @media (max-width: 400px) {
+            .brand-text { display: none; }
+        }
         .settings-drawer { overflow: hidden; padding: 5px 8px 10px 18px; background: #f8fafc; animation: settingsSlideDown .24s ease-out both; }
         .settings-drawer-item { display: flex !important; justify-content: flex-start !important; gap: 9px; align-items: center; padding: 9px 10px 9px 12px !important; border: 0 !important; border-left: 2px solid #dbeafe !important; border-radius: 0 6px 6px 0; font-size: 12.5px !important; color: #475569 !important; }
         .settings-drawer-item:hover, .settings-drawer-item.current { background: #eaf2ff !important; color: #2563eb !important; border-left-color: #2563eb !important; }
@@ -1578,6 +1697,7 @@ def dashboard():
     _acc = access_map(role)
     if tab in TAB_MODULE and not _acc.get(TAB_MODULE[tab], False):
         tab = 'noaccess'
+    _can = {a[0]: bool(role == 'HR' or is_owner() or (_acc.get(a[1]) and _acc.get(a[0]))) for a in ACCESS_ACTIONS}
     theme_key = get_user_theme(session.get('user') or session.get('user_id'))
 
     # Escaped versions for safe HTML output
@@ -1832,7 +1952,9 @@ def dashboard():
                 e_desig = esc(emp['designation'])
                 e_oper = esc(emp['operator'])
                 e_name_js = js_attr(emp['name'])
-                checkbox_cell = f'<td style="width: 30px; text-align: center;"><input type="checkbox" name="emp_ids" value="{emp["id"]}" class="member-checkbox" onchange="checkSelectedCount(\'member-checkbox\', \'bulkDeleteMemberBtn\')"></td>' if role in ["HR", "Admin"] else '<td></td>'
+                m_edit = (f'<a href="#" onclick="openEditModal({emp["id"]}, {e_name_js}, {emp["balance"]}); return false;">✏️ Edit</a>') if _can['employees.edit'] else ''
+                m_del = (f'<a href="#" onclick="confirmDelete({emp["id"]}, {e_name_js}); return false;" class="delete-item">🗑️ Delete</a>') if _can['employees.delete'] else ''
+                checkbox_cell = f'<td style="width: 30px; text-align: center;"><input type="checkbox" name="emp_ids" value="{emp["id"]}" class="member-checkbox" onchange="checkSelectedCount(\'member-checkbox\', \'bulkDeleteMemberBtn\')"></td>' if _can['employees.delete'] else '<td></td>'
                 
                 table_rows += f'''
                     <tr>
@@ -1847,9 +1969,9 @@ def dashboard():
                             <div class="dropdown" id="dropdown-{emp['id']}">
                                 <button type="button" onclick="toggleRowDropdown({emp['id']}, event)" class="dropbtn">⋮</button>
                                 <div class="dropdown-content" id="dropdown-content-{emp['id']}">
-                                    <a href="#" onclick="openEditModal({emp['id']}, {e_name_js}, {emp['balance']}); return false;">✏️ Edit</a>
+                                    {m_edit}
                                     <a href="/print_member/{emp['id']}" target="_blank">🖨️ Print</a>
-                                    <a href="#" onclick="confirmDelete({emp['id']}, {e_name_js}); return false;" class="delete-item">🗑️ Delete</a>
+                                    {m_del}
                                 </div>
                             </div>
                         </td>
@@ -1857,7 +1979,7 @@ def dashboard():
                 '''
             
         add_form_section = ""
-        if role in ["HR", "Admin"]:
+        if _can['employees.add']:
             show_add = request.args.get('show_add') == '1'
             display_value = 'block' if show_add else 'none'
             add_form_section = """
@@ -1973,8 +2095,8 @@ def dashboard():
             </script>
             """
 
-        bulk_delete_btn = f'''<button type="button" id="bulkDeleteMemberBtn" onclick="submitBulkDelete('bulkDeleteMemberForm', 'member', 'member-checkbox')" class="btn-danger" style="display: none; padding: 7px 14px; font-weight: bold; margin-right: 8px;">🗑️ Delete Selected</button>''' if role in ["HR", "Admin"] else ""
-        add_button_html = f'''<a href="/dashboard?tab=employees&show_add=1" style="background: #2563EB; color: white; padding: 8px 16px; border-radius: 6px; text-decoration: none; font-size: 14px; font-weight: bold; display: inline-flex; align-items: center; gap: 6px;">+ Add Member</a>''' if role in ["HR", "Admin"] else ""
+        bulk_delete_btn = f'''<button type="button" id="bulkDeleteMemberBtn" onclick="submitBulkDelete('bulkDeleteMemberForm', 'member', 'member-checkbox')" class="btn-danger" style="display: none; padding: 7px 14px; font-weight: bold; margin-right: 8px;">🗑️ Delete Selected</button>''' if _can['employees.delete'] else ""
+        add_button_html = f'''<a href="/dashboard?tab=employees&show_add=1" style="background: #2563EB; color: white; padding: 8px 16px; border-radius: 6px; text-decoration: none; font-size: 14px; font-weight: bold; display: inline-flex; align-items: center; gap: 6px;">+ Add Member</a>''' if _can['employees.add'] else ""
 
         filter_button_html = '''
         <div style="position: relative; display: inline-block;">
@@ -2047,7 +2169,7 @@ def dashboard():
         </script>
         """
 
-        master_chk = f'<input type="checkbox" id="selectAllMember" onclick="toggleSelectAll(this, \'member-checkbox\', \'bulkDeleteMemberBtn\')">' if role in ["HR", "Admin"] else ''
+        master_chk = f'<input type="checkbox" id="selectAllMember" onclick="toggleSelectAll(this, \'member-checkbox\', \'bulkDeleteMemberBtn\')">' if _can['employees.delete'] else ''
 
         metrics_cards_html = f'''
         <div class="metrics-grid">
@@ -2111,7 +2233,7 @@ def dashboard():
     elif tab == 'requisitions':
         req_rows = ""
         if len(requisitions) == 0:
-            req_rows = '<tr><td colspan="7" style="text-align: center; color: #64748b;">No requisitions submitted yet.</td></tr>'
+            req_rows = '<tr><td colspan="8" style="text-align: center; color: #64748b;">No requisitions submitted yet.</td></tr>'
         else:
             for req in requisitions:
                 if req['status'] == "Pending":
@@ -2126,7 +2248,7 @@ def dashboard():
                     status_badge += f'<div style="font-size: 11px; color: #dc2626; margin-top: 4px; max-width: 220px;">Remark: {esc(req_remark)}</div>'
 
                 approve_links = ""
-                if role in ["HR", "Admin"] and req['status'] == "Pending":
+                if _can['requisitions.approve'] and req['status'] == "Pending":
                     approve_links = f'''
                         <a href="/update_requisition/{req['id']}/Approved" style="color: #10b981; font-weight: bold; text-decoration: none;">Approve</a>
                         <a href="#" onclick="rejectRequisition({req['id']}); return false;" style="color: #dc2626; font-weight: bold; text-decoration: none;">Reject</a>
@@ -2134,19 +2256,25 @@ def dashboard():
 
                 r_type_js = js_attr(req['type'])
                 r_details_js = js_attr(req['details'])
+                r_amt = to_int(req['amount'], 0) if 'amount' in req.keys() else 0
+                r_edit = (f'<a href="#" onclick="openEditReqModal({req["id"]}, {r_type_js}, {r_details_js}, {r_amt}); return false;">✏️ Edit</a>') if _can['requisitions.edit'] else ''
+                r_del = (f'<a href="#" onclick="confirmDeleteReq({req["id"]}); return false;" class="delete-item">🗑️ Delete</a>') if _can['requisitions.delete'] else ''
+                amt_cell = '-'
+                if r_amt > 0:
+                    amt_cell = f'<b>{_cur_sym}{r_amt}</b>' + ('<div style="font-size:11px;color:#15803d;margin-top:2px">Deducted from fund</div>' if req['status'] == 'Approved' else '')
 
                 action_dropdown = f'''
                     <div class="dropdown" id="dropdown-{req['id']}">
                         <button type="button" onclick="toggleRowDropdown({req['id']}, event)" class="dropbtn">⋮</button>
                         <div class="dropdown-content" id="dropdown-content-{req['id']}">
-                            <a href="#" onclick="openEditReqModal({req['id']}, {r_type_js}, {r_details_js}); return false;">✏️ Edit</a>
+                            {r_edit}
                             <a href="/print_requisition/{req['id']}" target="_blank">🖨️ Print</a>
-                            <a href="#" onclick="confirmDeleteReq({req['id']}); return false;" class="delete-item">🗑️ Delete</a>
+                            {r_del}
                         </div>
                     </div>
                 '''
                 
-                chk_cell = f'<td style="width: 30px; text-align: center;"><input type="checkbox" name="req_ids" value="{req["id"]}" class="req-checkbox" onchange="checkSelectedCount(\'req-checkbox\', \'bulkDeleteReqBtn\')"></td>' if role in ["HR", "Admin"] else '<td></td>'
+                chk_cell = f'<td style="width: 30px; text-align: center;"><input type="checkbox" name="req_ids" value="{req["id"]}" class="req-checkbox" onchange="checkSelectedCount(\'req-checkbox\', \'bulkDeleteReqBtn\')"></td>' if _can['requisitions.delete'] else '<td></td>'
 
                 req_rows += f'''
                     <tr>
@@ -2155,6 +2283,7 @@ def dashboard():
                         <td><b>{esc(req['emp_name'])}</b></td>
                         <td>{esc(req['type'])}</td>
                         <td>{esc(req['details'])}</td>
+                        <td>{amt_cell}</td>
                         <td>{status_badge}</td>
                         <td>
                             <div style="display: flex; align-items: center; justify-content: flex-end; gap: 10px;">
@@ -2165,8 +2294,8 @@ def dashboard():
                     </tr>
                 '''
             
-        req_bulk_btn = f'''<button type="button" id="bulkDeleteReqBtn" onclick="submitBulkDelete('bulkDeleteReqForm', 'requisition', 'req-checkbox')" class="btn-danger" style="display: none; padding: 7px 14px; font-weight: bold;">🗑️ Delete Selected</button>''' if role in ["HR", "Admin"] else ""
-        master_req_chk = f'<input type="checkbox" id="selectAllReq" onclick="toggleSelectAll(this, \'req-checkbox\', \'bulkDeleteReqBtn\')">' if role in ["HR", "Admin"] else ''
+        req_bulk_btn = f'''<button type="button" id="bulkDeleteReqBtn" onclick="submitBulkDelete('bulkDeleteReqForm', 'requisition', 'req-checkbox')" class="btn-danger" style="display: none; padding: 7px 14px; font-weight: bold;">🗑️ Delete Selected</button>''' if _can['requisitions.delete'] else ""
+        master_req_chk = f'<input type="checkbox" id="selectAllReq" onclick="toggleSelectAll(this, \'req-checkbox\', \'bulkDeleteReqBtn\')">' if _can['requisitions.delete'] else ''
 
         req_filter_button_html = '''
         <div style="position: relative; display: inline-block;">
@@ -2231,6 +2360,10 @@ def dashboard():
                         <label style="font-size: 13px; color: #64748b; font-weight: bold;">Details Description</label>
                         <input type="text" name="details" placeholder="Describe your request..." required style="margin-top: 5px;">
                     </div>
+                    <div>
+                        <label style="font-size: 13px; color: #64748b; font-weight: bold;">Amount (optional)</label>
+                        <input type="number" name="amount" min="0" placeholder="0 if no money is needed" style="margin-top: 5px;">
+                    </div>
                     <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 10px;">
                         <a href="/dashboard?tab=requisitions" style="background: #64748b; color: white; padding: 8px 16px; border-radius: 6px; text-decoration: none; font-size: 14px;">Cancel</a>
                         <button type="submit" style="background: #2563EB;">Submit Request</button>
@@ -2258,6 +2391,11 @@ def dashboard():
                         <label style="font-size: 13px; color: #64748b; font-weight: bold;">Details Description</label>
                         <input type="text" name="details" id="editReqDetails" required style="margin-top: 5px;">
                     </div>
+                    <div>
+                        <label style="font-size: 13px; color: #64748b; font-weight: bold;">Amount (optional)</label>
+                        <input type="number" name="amount" id="editReqAmount" min="0" placeholder="0" style="margin-top: 5px;">
+                        <div style="font-size: 11px; color: #64748b; margin-top: 4px;">If this requisition is already approved, the fund is updated too.</div>
+                    </div>
                     <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 10px;">
                         <button type="button" onclick="closeEditReqModal()" style="background: #64748b;">Cancel</button>
                         <button type="submit" style="background: #10b981;">Save Changes</button>
@@ -2266,11 +2404,12 @@ def dashboard():
             </div>
         </div>
         <script>
-            function openEditReqModal(id, type, details) {
+            function openEditReqModal(id, type, details, amount) {
                 document.getElementById('editReqId').value = id;
                 document.getElementById('editReqIdTitle').innerText = id;
                 document.getElementById('editReqType').value = type;
                 document.getElementById('editReqDetails').value = details;
+                document.getElementById('editReqAmount').value = amount || '';
                 document.getElementById('editReqModal').style.display = 'flex';
             }
             function closeEditReqModal() {
@@ -2320,7 +2459,7 @@ def dashboard():
         </script>
         """
 
-        add_req_btn_html = '''<a href="/dashboard?tab=requisitions&show_add_req=1" style="background: #2563EB; color: white; padding: 8px 16px; border-radius: 6px; text-decoration: none; font-size: 14px; font-weight: bold; display: inline-flex; align-items: center; gap: 6px;">+ Add New Requisition</a>'''
+        add_req_btn_html = '''<a href="/dashboard?tab=requisitions&show_add_req=1" style="background: #2563EB; color: white; padding: 8px 16px; border-radius: 6px; text-decoration: none; font-size: 14px; font-weight: bold; display: inline-flex; align-items: center; gap: 6px;">+ Add New Requisition</a>''' if _can['requisitions.add'] else ''
 
         req_metrics_cards_html = f'''
         <div class="metrics-grid">
@@ -2366,6 +2505,7 @@ def dashboard():
                             <th>Employee</th>
                             <th>Request Type</th>
                             <th>Details</th>
+                            <th>Amount</th>
                             <th>Status</th>
                             <th style="text-align: right;">Action</th>
                         </tr>
@@ -2400,13 +2540,14 @@ def dashboard():
                   <td><div class="user-row-menu">
                     <button type="button" class="user-dots" onclick="toggleUserMenu({u['id']})" aria-label="User options">⋮</button>
                     <div class="user-menu" id="userMenu{u['id']}">
-                      {('<button type="button" onclick="openEditUser(' + str(u['id']) + ', this)" data-name="' + esc(u["full_name"]) + '" data-uid="' + esc(u["user_id"]) + '" data-email="' + esc(u["email"] or "") + '" data-role="' + esc(u["role"]) + '">✎ Edit Profile</button>') if is_full() or u["role"] == 'Member' else ''}
+                      {('<button type="button" onclick="openEditUser(' + str(u['id']) + ', this)" data-name="' + esc(u["full_name"]) + '" data-uid="' + esc(u["user_id"]) + '" data-email="' + esc(u["email"] or "") + '" data-role="' + esc(u["role"]) + '">✎ Edit Profile</button>') if _can['users.edit'] and (is_full() or u["role"] == 'Member') else ''}
                       {('<form method="POST" action="/approve_user/' + str(u['id']) + '"><button type="submit">✓ Approve</button></form><form method="POST" action="/reject_user/' + str(u['id']) + '" onsubmit="return confirm(&quot;Reject this account?&quot;)"><button type="submit" class="reject-user-action">✕ Reject</button></form>') if role == 'HR' and status == 'Pending' else ''}
-                      {('<form method="POST" action="/delete_user/' + str(u['id']) + '" onsubmit="return confirm(&quot;Delete this user permanently? This cannot be undone.&quot;)"><button type="submit" class="reject-user-action">🗑️ Delete</button></form>') if (is_full() or u["role"] == 'Member') and (u["user_id"] or '').lower() != (session.get('user_id') or '').lower() and ADMIN_IDENTIFIER.lower() not in ((u["email"] or '').lower(), (u["user_id"] or '').lower()) else ''}
+                      {('<form method="POST" action="/delete_user/' + str(u['id']) + '" onsubmit="return confirm(&quot;Delete this user permanently? This cannot be undone.&quot;)"><button type="submit" class="reject-user-action">🗑️ Delete</button></form>') if _can['users.delete'] and (is_full() or u["role"] == 'Member') and (u["user_id"] or '').lower() != (session.get('user_id') or '').lower() and ADMIN_IDENTIFIER.lower() not in ((u["email"] or '').lower(), (u["user_id"] or '').lower()) else ''}
                     </div>
                   </div></td></tr>'''
             if not rows_html:
                 rows_html = '<tr><td colspan="7" style="text-align:center;padding:24px;color:#64748b">No user accounts created yet.</td></tr>'
+            _user_toolbar = '<div class="users-toolbar"><button type="button" class="add-user-btn" onclick="openUserModal()">＋ Add New User</button></div>' if _can['users.create'] else ''
             role_options = '<option value="Member">Member</option>' if not is_full() else '<option value="Member">Member</option><option value="HR">HR</option><option value="Admin">Admin</option>'
             content_area = f'''<style>
             .users-toolbar{{background:#2563eb;padding:12px 20px;border-radius:8px;display:flex;justify-content:flex-end;margin-bottom:22px}}
@@ -2438,7 +2579,7 @@ def dashboard():
             .user-menu .reject-user-action{{color:#b91c1c}}
             @media(max-width:700px){{.users-grid{{grid-template-columns:1fr}}.users-card{{padding:12px}}}}
             </style>
-            <div class="users-toolbar"><button type="button" class="add-user-btn" onclick="openUserModal()">＋ Add New User</button></div>
+            {_user_toolbar}
             <div class="users-card">
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
                 <div><h2 style="margin:0;color:#1e293b;font-size:20px">👤 User Management</h2><p style="margin:4px 0 0;color:#64748b;font-size:13px">Accounts and approval status</p></div>
@@ -2513,7 +2654,7 @@ def dashboard():
             recycle_ensure(rb_conn)
             rb_rows = rb_conn.execute("SELECT * FROM recycle_bin ORDER BY id DESC").fetchall()
             rb_conn.close()
-            type_icon = {'User': '👤', 'Member': '👥', 'Requisition': '📋'}
+            type_icon = {'User': '👤', 'Member': '👥', 'Requisition': '📋', 'Fund': '🏦'}
             rb_html = ''
             for r_ in rb_rows:
                 try:
@@ -2716,17 +2857,35 @@ def dashboard():
         for i, (mk, ic, title, desc) in enumerate(ACCESS_MODULES):
             if _is_hr:
                 _tg = ''.join(
-                    f'<div class="ac-role"><span>{r}</span><label class="ac-switch"><input type="checkbox" {"checked" if _maps[r][mk] else ""} onchange="acToggle(this,\'{r}\',\'{mk}\')"><i></i></label></div>'
+                    f'<div class="ac-role"><span>{r}</span><label class="ac-switch"><input type="checkbox" data-mod="{mk}" data-role="{r}" {"checked" if _maps[r][mk] else ""} onchange="acToggle(this,\'{r}\',\'{mk}\')"><i></i></label></div>'
                     for r in _roles)
                 _tg += '<div class="ac-role locked"><span>HR</span><b>🔒 Full</b></div>'
             else:
                 _on = _acc.get(mk, False)
                 _tg = f'<div class="ac-role locked"><span>Your access</span><b class="{"ok" if _on else "no"}">{"✔ Allowed" if _on else "✖ Blocked"}</b></div>'
-            _cards += f'<div class="ac-card" style="animation-delay:{i*0.07}s"><div class="ac-ico">{ic}</div><div class="ac-title">{esc(title)}</div><div class="ac-desc">{esc(desc)}</div><div class="ac-roles">{_tg}</div></div>'
-        _sub = 'Choose which modules each role can open. Changes apply instantly.' if _is_hr else 'These are the modules currently available to your account.'
+            _acts_html = ''
+            _mod_acts = [a_ for a_ in ACCESS_ACTIONS if a_[1] == mk]
+            if _mod_acts:
+                _rows = ''
+                for ak, am, al, ar in _mod_acts:
+                    if _is_hr:
+                        _cells = ''
+                        for r in _roles:
+                            if r in ar:
+                                _cells += (f'<label class="ac-mini{" dim" if not _maps[r][mk] else ""}" data-mod="{mk}" data-role="{r}"><em>{r}</em>'
+                                           f'<span class="ac-switch sm"><input type="checkbox" {"checked" if _maps[r][ak] else ""} onchange="acToggle(this,\'{r}\',\'{ak}\')"><i></i></span></label>')
+                            else:
+                                _cells += f'<span class="ac-mini na"><em>{r}</em><b>n/a</b></span>'
+                    else:
+                        _okk = _can.get(ak, False)
+                        _cells = f'<b class="{"ok" if _okk else "no"}">{"✔ Allowed" if _okk else "✖ Blocked"}</b>'
+                    _rows += f'<div class="ac-act"><div class="ac-act-l">{esc(al)}</div><div class="ac-act-t">{_cells}</div></div>'
+                _acts_html = '<div class="ac-acts"><div class="ac-acts-h">Button permissions</div>' + _rows + '</div>'
+            _cards += f'<div class="ac-card" style="animation-delay:{i*0.07}s"><div class="ac-ico">{ic}</div><div class="ac-title">{esc(title)}</div><div class="ac-desc">{esc(desc)}</div><div class="ac-roles">{_tg}</div>{_acts_html}</div>'
+        _sub = 'Choose which modules and which buttons (add, edit, delete, approve) each role can use. Changes apply instantly.' if _is_hr else 'These are the modules and buttons currently available to your account.'
         _reset = '<button class="ac-reset" onclick="acReset()">↺ Reset to default</button>' if _is_hr else ''
         content_area = """<style>
-        .ac-wrap{background:radial-gradient(800px 300px at 0% 0%,rgba(37,99,235,.35),transparent 60%),linear-gradient(135deg,#0b1220,#0f1b36);border-radius:16px;padding:26px;color:#e2e8f0;box-shadow:0 20px 50px -20px rgba(2,6,23,.7);position:relative;overflow:hidden}
+        .ac-wrap{background:radial-gradient(800px 300px at 0% 0%,rgba(37,99,235,.35),transparent 60%),linear-gradient(135deg,#0b1220,#0f1b36);border-radius:16px;padding:26px;color:#e2e8f0;box-shadow:0 20px 50px -20px rgba(2,6,23,.7);position:relative;overflow:hidden;box-sizing:border-box;max-width:100%}
         .ac-wrap::before{content:"";position:absolute;inset:0;background-image:linear-gradient(rgba(148,163,184,.07) 1px,transparent 1px),linear-gradient(90deg,rgba(148,163,184,.07) 1px,transparent 1px);background-size:38px 38px;pointer-events:none}
         .ac-head{position:relative;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:22px}
         .ac-head h2{margin:0;font-size:22px;color:#fff;letter-spacing:.5px}
@@ -2735,8 +2894,8 @@ def dashboard():
         @keyframes acPulse{70%{box-shadow:0 0 0 10px rgba(34,211,238,0)}100%{box-shadow:0 0 0 0 rgba(34,211,238,0)}}
         .ac-reset{background:rgba(255,255,255,.08);color:#e2e8f0;border:1px solid rgba(255,255,255,.18);padding:8px 14px;border-radius:8px;cursor:pointer;font-size:13px}
         .ac-reset:hover{background:rgba(34,211,238,.18);border-color:#22d3ee}
-        .ac-grid{position:relative;display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}
-        .ac-card{background:rgba(15,27,54,.75);border:1px solid rgba(96,165,250,.25);border-radius:14px;padding:18px;backdrop-filter:blur(6px);animation:acIn .5s ease both;transition:transform .25s,box-shadow .25s,border-color .25s}
+        .ac-grid{position:relative;display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,270px),1fr));gap:16px}
+        .ac-card{background:rgba(15,27,54,.75);border:1px solid rgba(96,165,250,.25);border-radius:14px;padding:18px;backdrop-filter:blur(6px);animation:acIn .5s ease both;transition:transform .25s,box-shadow .25s,border-color .25s;min-width:0}
         .ac-card:hover{transform:translateY(-4px);border-color:#22d3ee;box-shadow:0 0 28px -6px rgba(34,211,238,.55)}
         @keyframes acIn{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
         .ac-ico{font-size:28px;width:50px;height:50px;border-radius:12px;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,rgba(37,99,235,.45),rgba(6,182,212,.35));box-shadow:0 0 18px rgba(37,99,235,.5)}
@@ -2745,14 +2904,47 @@ def dashboard():
         .ac-roles{border-top:1px dashed rgba(148,163,184,.25);padding-top:10px}
         .ac-role{display:flex;justify-content:space-between;align-items:center;padding:6px 0;font-size:13px;color:#cbd5e1}
         .ac-role.locked b{font-size:12px;color:#7dd3fc}.ac-role b.ok{color:#4ade80}.ac-role b.no{color:#f87171}
-        .ac-switch{position:relative;width:46px;height:24px;display:inline-block}
-        .ac-switch input{opacity:0;width:0;height:0}
+        .ac-switch{position:relative;width:46px;height:24px;display:inline-block;flex:none}
+        .ac-switch input{opacity:0;width:0;height:0;position:absolute}
         .ac-switch i{position:absolute;inset:0;background:#334155;border-radius:24px;cursor:pointer;transition:.3s}
         .ac-switch i::before{content:"";position:absolute;width:18px;height:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.3s}
         .ac-switch input:checked+i{background:linear-gradient(90deg,#2563eb,#06b6d4);box-shadow:0 0 12px rgba(6,182,212,.7)}
         .ac-switch input:checked+i::before{transform:translateX(22px)}
-        .ac-toast{position:fixed;right:24px;bottom:24px;background:#0f172a;color:#e2e8f0;border:1px solid #22d3ee;padding:10px 16px;border-radius:10px;font-size:13px;opacity:0;transform:translateY(10px);transition:.3s;z-index:9999;pointer-events:none}
+        .ac-switch input:focus-visible+i{outline:2px solid #22d3ee;outline-offset:2px}
+        .ac-acts{margin-top:12px;border-top:1px dashed rgba(148,163,184,.25);padding-top:10px}
+        .ac-acts-h{font-size:11px;letter-spacing:.6px;text-transform:uppercase;color:#7dd3fc;margin-bottom:4px}
+        .ac-act{padding:9px 0;border-bottom:1px solid rgba(148,163,184,.12)}
+        .ac-act:last-child{border-bottom:0}
+        .ac-act-l{font-size:13px;color:#e2e8f0;margin-bottom:7px}
+        .ac-act-t{display:flex;gap:10px 18px;flex-wrap:wrap;align-items:center}
+        .ac-act-t b.ok{color:#4ade80;font-size:12px}.ac-act-t b.no{color:#f87171;font-size:12px}
+        .ac-mini{display:inline-flex;align-items:center;gap:8px;font-size:12px;color:#cbd5e1;transition:opacity .2s}
+        .ac-mini em{font-style:normal}
+        .ac-mini.dim{opacity:.4}
+        .ac-mini.na{opacity:.5}
+        .ac-switch.sm{width:38px;height:20px}
+        .ac-switch.sm i::before{width:14px;height:14px}
+        .ac-switch.sm input:checked+i::before{transform:translateX(18px)}
+        .ac-toast{position:fixed;right:24px;bottom:24px;background:#0f172a;color:#e2e8f0;border:1px solid #22d3ee;padding:10px 16px;border-radius:10px;font-size:13px;opacity:0;transform:translateY(10px);transition:.3s;z-index:9999;pointer-events:none;max-width:calc(100vw - 24px)}
         .ac-toast.show{opacity:1;transform:none}
+        @media(hover:none){.ac-card:hover{transform:none;box-shadow:none;border-color:rgba(96,165,250,.25)}}
+        @media(max-width:640px){
+          .ac-wrap{padding:16px;border-radius:12px}
+          .ac-head{flex-direction:column;align-items:stretch;margin-bottom:16px}
+          .ac-head h2{font-size:19px}
+          .ac-reset{width:100%;padding:12px}
+          .ac-grid{grid-template-columns:minmax(0,1fr);gap:12px}
+          .ac-card{padding:14px}
+          .ac-role{padding:9px 0}
+          .ac-switch{width:52px;height:28px}
+          .ac-switch i::before{width:22px;height:22px}
+          .ac-switch input:checked+i::before{transform:translateX(24px)}
+          .ac-switch.sm{width:46px;height:26px}
+          .ac-switch.sm i::before{width:20px;height:20px}
+          .ac-switch.sm input:checked+i::before{transform:translateX(20px)}
+          .ac-mini{gap:10px;font-size:13px}
+          .ac-toast{left:12px;right:12px;bottom:calc(12px + env(safe-area-inset-bottom,0px));text-align:center}
+        }
         </style>
         <div class="ac-wrap">
           <div class="ac-head"><div><h2><span class="ac-pulse"></span>ACCESS CONTROL</h2><p>""" + _sub + """</p></div>""" + _reset + """</div>
@@ -2761,7 +2953,7 @@ def dashboard():
         <div class="ac-toast" id="acToast"></div>
         <script>
         function acToast(t){var e=document.getElementById('acToast');e.textContent=t;e.classList.add('show');setTimeout(function(){e.classList.remove('show')},1800)}
-        function acToggle(el,role,mod){fetch('/access/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({role:role,module:mod,allowed:el.checked})}).then(function(r){return r.json()}).then(function(d){if(d.ok){acToast('Saved: '+role+' → '+mod+' '+(el.checked?'ON':'OFF'))}else{el.checked=!el.checked;acToast('Not allowed')}}).catch(function(){el.checked=!el.checked;acToast('Error')})}
+        function acToggle(el,role,mod){fetch('/access/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({role:role,module:mod,allowed:el.checked})}).then(function(r){return r.json()}).then(function(d){if(d.ok){if(mod.indexOf('.')<0){document.querySelectorAll('.ac-mini[data-mod="'+mod+'"][data-role="'+role+'"]').forEach(function(m){m.classList.toggle('dim',!el.checked)})}acToast('Saved: '+role+' → '+mod+' '+(el.checked?'ON':'OFF'))}else{el.checked=!el.checked;acToast('Not allowed')}}).catch(function(){el.checked=!el.checked;acToast('Error')})}
         function acReset(){if(!confirm('Reset all permissions to default?'))return;fetch('/access/reset',{method:'POST'}).then(function(){location.reload()})}
         </script>"""
 
@@ -2843,9 +3035,14 @@ def dashboard():
             _frows = _fc.execute("SELECT * FROM fund_transactions ORDER BY id DESC LIMIT 50").fetchall()
             _fc.close()
             _cs = esc(settings.get('currency_symbol', '৳'))
+            def _fund_act(r):
+                if r["req_id"]:
+                    return f'<span class="fund-lock">🔗 Requisition #{r["req_id"]} (auto)</span>'
+                return (f'<button type="button" class="fund-btn" data-id="{r["id"]}" data-kind="{esc(r["kind"])}" data-amount="{r["amount"]}" data-note="{esc(r["note"] or "")}" onclick="fundEdit(this)">✏️ Edit</button>'
+                        f'<button type="button" class="fund-btn del" onclick="fundDel({r["id"]})">🗑️ Delete</button>')
             _trs = ''.join(
-                f'<tr><td>{esc(r["created_at"])}</td><td><span style="padding:3px 9px;border-radius:20px;font-size:11px;font-weight:700;{"background:#dcfce7;color:#15803d" if r["kind"]=="Deposit" else "background:#fee2e2;color:#b91c1c"}">{esc(r["kind"])}</span></td><td>{_cs}{r["amount"]}</td><td>{esc(r["note"] or "-")}</td><td>{esc(r["created_by"] or "-")}</td></tr>'
-                for r in _frows) or '<tr><td colspan="5" style="text-align:center;color:#64748b">No fund entries yet.</td></tr>'
+                f'<tr><td>{esc(r["created_at"])}</td><td><span style="padding:3px 9px;border-radius:20px;font-size:11px;font-weight:700;{"background:#dcfce7;color:#15803d" if r["kind"]=="Deposit" else "background:#fee2e2;color:#b91c1c"}">{esc(r["kind"])}</span></td><td>{_cs}{r["amount"]}</td><td>{esc(r["note"] or "-")}</td><td>{esc(r["created_by"] or "-")}</td><td>{_fund_act(r)}</td></tr>'
+                for r in _frows) or '<tr><td colspan="6" style="text-align:center;color:#64748b">No fund entries yet.</td></tr>'
             content_area = f"""<style>
             .fund-top{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-bottom:18px}}
             .fund-box{{border-radius:14px;padding:18px;color:#fff;box-shadow:0 10px 24px -12px rgba(0,0,0,.4)}}
@@ -2854,7 +3051,7 @@ def dashboard():
             .fund-form label{{display:block;font-size:12px;font-weight:600;color:#334155;margin-bottom:5px}}
             .fund-form input,.fund-form select{{padding:10px;border:1px solid #cbd5e1;border-radius:7px}}
             </style>
-            <div style="display:flex;align-items:center;gap:10px;margin-bottom:18px"><span style="font-size:25px">🏦</span><div><h2 style="margin:0;color:#1e293b">Fund Management</h2><p style="margin:3px 0 0;color:#64748b;font-size:13px">Record how much money you have in the fund.</p></div></div>
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:18px"><span style="font-size:25px">🏦</span><div><h2 style="margin:0;color:#1e293b">Fund Management</h2><p style="margin:3px 0 0;color:#64748b;font-size:13px">Record how much money you have in the fund. Approved requisitions with an amount are deducted automatically.</p></div></div>
             <div class="fund-top">
               <div class="fund-box" style="background:linear-gradient(135deg,#059669,#10b981)"><small>TOTAL BALANCE (AVAILABLE)</small><div>{_cs}{_ftotal}</div></div>
               <div class="fund-box" style="background:linear-gradient(135deg,#2563eb,#06b6d4)"><small>TOTAL ADDED</small><div>{_cs}{_dep}</div></div>
@@ -2866,7 +3063,7 @@ def dashboard():
               <div style="flex:1;min-width:180px"><label>Note</label><input type="text" name="note" placeholder="Source / reason" style="width:100%"></div>
               <button type="submit">Save</button>
             </form>
-            <div class="panel"><h3>Recent fund entries</h3><table><thead><tr><th>Date</th><th>Type</th><th>Amount</th><th>Note</th><th>By</th></tr></thead><tbody>{_trs}</tbody></table></div>"""
+            <div class="panel"><h3>Recent fund entries</h3><div style="overflow-x:auto"><table><thead><tr><th>Date</th><th>Type</th><th>Amount</th><th>Note</th><th>By</th><th>Action</th></tr></thead><tbody>{_trs}</tbody></table></div></div>""" + FUND_EXTRA
 
     notif_bell_html = HR_BELL_HTML if role == 'HR' else ''
     if role == 'HR':
@@ -2882,6 +3079,7 @@ def dashboard():
             + ('<span class="notif-badge show" style="background:#64748b">' + (str(_bin_count) if _bin_count < 100 else '99+') + '</span>' if _bin_count else '') + '</a>') + notif_bell_html
     body_content = f'''
     <div class="top-header">
+        <button type="button" class="nav-toggle" id="navToggle" aria-label="Open menu" onclick="toggleNav()">&#9776;</button>
         {brand_logo_html}
         <div style="display:flex;align-items:center;gap:18px;">
         {notif_bell_html}
@@ -2920,6 +3118,8 @@ def dashboard():
             {('<div class="settings-drawer">' + ''.join(f'<a class="settings-drawer-item {"current" if request.args.get("section", "general") == k else ""}" href="/dashboard?tab=settings&section={k}"><span class="settings-drawer-arrow">›</span><span>{esc(v)}</span></a>' for i,(k,v) in enumerate([('general','General / Company'),('operator','Operator & Recharge'),('member','Member Settings'),('requisition','Requisition Settings'),('roles','Role & Permission'),('security','Security'),('notifications','Notifications'),('activity','Activity Log'),('backup','Data & Backup'),('print','Print Settings'),('theme','Theme / Display'),('fund','Fund Management')],1)) + '</div>') if tab == 'settings' and is_full() else ''}
             {('<a href="/dashboard?tab=reports" class="' + ('active' if tab == 'reports' else '') + '">📑 Report <span>›</span></a>') if role in ['Admin', 'HR'] else ''}
         </div>
+        <div class="nav-backdrop" id="navBackdrop" onclick="toggleNav()"></div>
+        <script>function toggleNav() {{ var s = document.querySelector('.sidebar'), b = document.getElementById('navBackdrop'); var o = s.classList.toggle('open'); b.classList.toggle('show', o); document.body.style.overflow = o ? 'hidden' : ''; }}</script>
         <div class="main-content">
             {content_area}
         </div>
@@ -2938,8 +3138,8 @@ def dashboard():
 @app.route('/create_user', methods=['POST'])
 def create_user():
     actor_role = session.get('role')
-    if not session.get('logged_in') or actor_role not in ('Admin', 'HR'):
-        return redirect(url_for('login'))
+    if not session.get('logged_in') or actor_role not in ('Admin', 'HR') or not can('users.create'):
+        return deny('users')
     full_name = request.form.get('full_name', '').strip()
     user_id = request.form.get('user_id', '').strip()
     email = request.form.get('email', '').strip().lower() or None
@@ -2969,8 +3169,8 @@ def create_user():
 @app.route('/edit_user', methods=['POST'])
 def edit_user():
     actor_role = session.get('role')
-    if not session.get('logged_in') or actor_role not in ('Admin', 'HR'):
-        return redirect(url_for('login'))
+    if not session.get('logged_in') or actor_role not in ('Admin', 'HR') or not can('users.edit'):
+        return deny('users')
     try:
         target_id = int(request.form.get('id', '0'))
     except ValueError:
@@ -3051,8 +3251,8 @@ def reject_user(user_id):
 @app.route('/delete_user/<int:user_id>', methods=['POST'])
 def delete_user(user_id):
     actor_role = session.get('role')
-    if not session.get('logged_in') or actor_role not in ('Admin', 'HR'):
-        return redirect(url_for('login'))
+    if not session.get('logged_in') or actor_role not in ('Admin', 'HR') or not can('users.delete'):
+        return deny('users')
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
     full_row = conn.execute("SELECT * FROM app_users WHERE id=?", (user_id,)).fetchone()
@@ -3146,8 +3346,8 @@ def update_profile():
 
 @app.route('/add_employee', methods=['POST'])
 def add_employee():
-    if not session.get('logged_in') or session.get('role') not in ['HR', 'Admin']:
-        return redirect(url_for('login'))
+    if not can('employees.add'):
+        return deny('employees')
     name = request.form.get('name', '').strip()
     phone = request.form.get('phone', '').strip()
     designation = request.form.get('designation', '').strip()
@@ -3194,8 +3394,8 @@ def add_employee():
 
 @app.route('/delete_member/<int:emp_id>')
 def delete_member(emp_id):
-    if not session.get('logged_in') or session.get('role') not in ['HR', 'Admin']:
-        return redirect(url_for('login'))
+    if not can('employees.delete'):
+        return deny('employees')
     
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
@@ -3215,8 +3415,8 @@ def delete_member(emp_id):
 
 @app.route('/bulk_delete_members', methods=['POST'])
 def bulk_delete_members():
-    if not session.get('logged_in') or session.get('role') not in ['HR', 'Admin']:
-        return redirect(url_for('login'))
+    if not can('employees.delete'):
+        return deny('employees')
         
     emp_ids = request.form.getlist('emp_ids')
     if emp_ids:
@@ -3235,44 +3435,50 @@ def bulk_delete_members():
 
 @app.route('/delete_requisition/<int:req_id>')
 def delete_requisition(req_id):
-    if not session.get('logged_in') or session.get('role') not in ['HR', 'Admin']:
-        return redirect(url_for('login'))
-    
+    if not can('requisitions.delete'):
+        return deny('requisitions')
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
     _r = conn.execute("SELECT * FROM requisitions WHERE id = ?", (req_id,)).fetchone()
+    refunded = False
     if _r:
+        refunded = bool(conn.execute("SELECT 1 FROM fund_transactions WHERE req_id=?", (req_id,)).fetchone())
+        req_fund_sync(conn, req_id, False)   # deleted requisition must not keep money out of the fund
         recycle_add(conn, 'Requisition', _r['id'], f"Requisition #{_r['id']} - {_r['type']} ({_r['emp_name']})", dict(_r))
     conn.execute("DELETE FROM requisitions WHERE id = ?", (req_id,))
     conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)", (f"Deleted requisition #{req_id}", actor_name()))
     conn.commit()
     conn.close()
-    return redirect(url_for('dashboard', tab='requisitions', delete_msg=f"Requisition <b>#{req_id}</b> has been moved to the recycle bin."))
+    msg = f"Requisition <b>#{req_id}</b> has been moved to the recycle bin."
+    if refunded:
+        msg += " Its amount was returned to the fund."
+    return redirect(url_for('dashboard', tab='requisitions', delete_msg=msg))
 
 @app.route('/bulk_delete_requisitions', methods=['POST'])
 def bulk_delete_requisitions():
-    if not session.get('logged_in') or session.get('role') not in ['HR', 'Admin']:
-        return redirect(url_for('login'))
-        
+    if not can('requisitions.delete'):
+        return deny('requisitions')
+
     req_ids = request.form.getlist('req_ids')
     if req_ids:
         conn = sqlite3.connect(DB_NAME)
         conn.row_factory = sqlite3.Row
         placeholders = ', '.join(['?'] * len(req_ids))
         for _r in conn.execute(f"SELECT * FROM requisitions WHERE id IN ({placeholders})", req_ids).fetchall():
+            req_fund_sync(conn, _r['id'], False)
             recycle_add(conn, 'Requisition', _r['id'], f"Requisition #{_r['id']} - {_r['type']} ({_r['emp_name']})", dict(_r))
         conn.execute(f"DELETE FROM requisitions WHERE id IN ({placeholders})", req_ids)
         conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)", (f"Bulk deleted {len(req_ids)} requisitions", actor_name()))
         conn.commit()
         conn.close()
         return redirect(url_for('dashboard', tab='requisitions', delete_msg=f"Successfully moved <b>{len(req_ids)}</b> selected requisition(s) to the recycle bin!"))
-        
+
     return redirect(url_for('dashboard', tab='requisitions', success_msg="No requisitions were selected."))
 
 @app.route('/update_balance', methods=['POST'])
 def update_balance():
-    if not session.get('logged_in') or session.get('role') not in ['HR', 'Admin']:
-        return redirect(url_for('login'))
+    if not can('employees.edit'):
+        return deny('employees')
     emp_id = request.form.get('emp_id')
     new_balance = to_int(request.form.get('new_balance', 0))
     conn = sqlite3.connect(DB_NAME)
@@ -3495,20 +3701,24 @@ def print_requisition(req_id):
 
 @app.route('/add_requisition', methods=['POST'])
 def add_requisition():
-    if not session.get('logged_in'):
-        return redirect(url_for('login'))
+    if not can('requisitions.add'):
+        return deny('requisitions')
     user = session.get('user_id', session.get('user'))
     req_type = request.form.get('req_type')
     details = request.form.get('details')
+    amount = max(to_int(request.form.get('amount'), 0), 0)
+    _max = to_int(load_settings().get('max_requisition_amount'), 0)
+    if _max and amount > _max:
+        return redirect(url_for('dashboard', tab='requisitions', success_msg=f"Amount is above the allowed limit ({_max})."))
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO requisitions (emp_name, type, details, status, created_date) VALUES (?, ?, ?, 'Pending', CURRENT_DATE)",
-                     (user, req_type, details))
+        cursor.execute("INSERT INTO requisitions (emp_name, type, details, status, created_date, amount) VALUES (?, ?, ?, 'Pending', CURRENT_DATE, ?)",
+                     (user, req_type, details, amount))
     except sqlite3.OperationalError:
-        cursor.execute("CREATE TABLE IF NOT EXISTS requisitions (id INTEGER PRIMARY KEY AUTOINCREMENT, emp_name TEXT NOT NULL, type TEXT NOT NULL, details TEXT NOT NULL, status TEXT DEFAULT 'Pending', created_date DATE DEFAULT CURRENT_DATE, remark TEXT)")
-        cursor.execute("INSERT INTO requisitions (emp_name, type, details, status, created_date) VALUES (?, ?, ?, 'Pending', CURRENT_DATE)",
-                     (user, req_type, details))
+        cursor.execute("CREATE TABLE IF NOT EXISTS requisitions (id INTEGER PRIMARY KEY AUTOINCREMENT, emp_name TEXT NOT NULL, type TEXT NOT NULL, details TEXT NOT NULL, status TEXT DEFAULT 'Pending', created_date DATE DEFAULT CURRENT_DATE, remark TEXT, amount INTEGER DEFAULT 0)")
+        cursor.execute("INSERT INTO requisitions (emp_name, type, details, status, created_date, amount) VALUES (?, ?, ?, 'Pending', CURRENT_DATE, ?)",
+                     (user, req_type, details, amount))
     conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)", (f"User submitted a requisition for {req_type}", actor_name()))
     conn.commit()
     conn.close()
@@ -3516,13 +3726,25 @@ def add_requisition():
 
 @app.route('/update_requisition_details', methods=['POST'])
 def update_requisition_details():
-    if not session.get('logged_in') or session.get('role') not in ['HR', 'Admin']:
-        return redirect(url_for('login'))
-    req_id = request.form.get('req_id')
+    if not can('requisitions.edit'):
+        return deny('requisitions')
+    req_id = to_int(request.form.get('req_id'), 0)
     req_type = request.form.get('req_type')
     details = request.form.get('details')
+    amount = max(to_int(request.form.get('amount'), 0), 0)
+    _max = to_int(load_settings().get('max_requisition_amount'), 0)
+    if _max and amount > _max:
+        return redirect(url_for('dashboard', tab='requisitions', success_msg=f"Amount is above the allowed limit ({_max})."))
     conn = sqlite3.connect(DB_NAME)
-    conn.execute("UPDATE requisitions SET type = ?, details = ? WHERE id = ?", (req_type, details, req_id))
+    conn.execute("UPDATE requisitions SET type = ?, details = ?, amount = ? WHERE id = ?", (req_type, details, amount, req_id))
+    st = conn.execute("SELECT status FROM requisitions WHERE id = ?", (req_id,)).fetchone()
+    if st and st[0] == 'Approved':
+        # Already approved: the fund entry must follow the new amount
+        ok, msg = req_fund_sync(conn, req_id, True)
+        if not ok:
+            conn.rollback()
+            conn.close()
+            return redirect(url_for('dashboard', tab='requisitions', success_msg="Not updated. " + msg))
     conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)", (f"Updated requisition #{req_id}", actor_name()))
     conn.commit()
     conn.close()
@@ -3530,9 +3752,8 @@ def update_requisition_details():
 
 @app.route('/update_requisition/<int:req_id>/<status>')
 def update_requisition(req_id, status):
-    if not session.get('logged_in') or session.get('role') not in ['HR', 'Admin']:
-        return redirect(url_for('login'))
-    # Only allow valid status values
+    if not can('requisitions.approve'):
+        return deny('requisitions')
     # Rejection must go through /reject_requisition (remark is required)
     if status == 'Rejected':
         return redirect(url_for('dashboard', tab='requisitions', success_msg="Error: A remark is required to reject a requisition!"))
@@ -3540,15 +3761,25 @@ def update_requisition(req_id, status):
         return redirect(url_for('dashboard', tab='requisitions', success_msg="Invalid status!"))
     conn = sqlite3.connect(DB_NAME)
     conn.execute("UPDATE requisitions SET status = ?, remark = NULL WHERE id = ?", (status, req_id))
+    # Approved -> money leaves the fund automatically; back to Pending -> money returns
+    ok, msg = req_fund_sync(conn, req_id, status == 'Approved')
+    if not ok:
+        conn.rollback()
+        conn.close()
+        return redirect(url_for('dashboard', tab='requisitions', success_msg="Cannot approve. " + msg + " Please add money to the fund first."))
     conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)", (f"Marked requisition #{req_id} as {status}", actor_name()))
+    amt_row = conn.execute("SELECT amount FROM requisitions WHERE id = ?", (req_id,)).fetchone()
     conn.commit()
     conn.close()
-    return redirect(url_for('dashboard', tab='requisitions', success_msg=f"Requisition has been {status.lower()}!"))
+    out = f"Requisition has been {status.lower()}!"
+    if status == 'Approved' and amt_row and to_int(amt_row[0], 0) > 0:
+        out += f" {load_settings().get('currency_symbol', '৳')}{to_int(amt_row[0], 0)} was deducted from the fund."
+    return redirect(url_for('dashboard', tab='requisitions', success_msg=out))
 
 @app.route('/reject_requisition', methods=['POST'])
 def reject_requisition():
-    if not session.get('logged_in') or session.get('role') not in ['HR', 'Admin']:
-        return redirect(url_for('login'))
+    if not can('requisitions.approve'):
+        return deny('requisitions')
     req_id = to_int(request.form.get('req_id'), 0)
     remark = (request.form.get('remark') or '').strip()
 
@@ -3562,6 +3793,7 @@ def reject_requisition():
         return redirect(url_for('dashboard', tab='requisitions', success_msg="Requisition not found!"))
 
     conn.execute("UPDATE requisitions SET status = 'Rejected', remark = ? WHERE id = ?", (remark, req_id))
+    req_fund_sync(conn, req_id, False)   # if it was approved before, give the money back
     conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)", (f"Rejected requisition #{req_id} with remark: {remark}", actor_name()))
     conn.commit()
     conn.close()
@@ -3797,7 +4029,8 @@ def access_toggle():
         return jsonify(ok=False), 403
     d = request.get_json(silent=True) or {}
     role_, mod, allowed = d.get('role'), d.get('module'), 1 if d.get('allowed') else 0
-    if role_ not in ('Admin', 'Member') or mod not in [m[0] for m in ACCESS_MODULES]:
+    _acts = {a[0]: a[3] for a in ACCESS_ACTIONS}
+    if role_ not in ('Admin', 'Member') or (mod not in [m[0] for m in ACCESS_MODULES] and role_ not in _acts.get(mod, ())):
         return jsonify(ok=False), 400
     conn = sqlite3.connect(DB_NAME)
     conn.execute("INSERT INTO access_control (role, module, allowed) VALUES (?,?,?) ON CONFLICT(role, module) DO UPDATE SET allowed=excluded.allowed", (role_, mod, allowed))
@@ -3837,6 +4070,68 @@ def fund_add():
     conn.commit()
     conn.close()
     return redirect(url_for('dashboard', tab='settings', section='fund', success_msg='Fund updated successfully.'))
+
+
+def _fund_back(msg):
+    return redirect(url_for('dashboard', tab='settings', section='fund', success_msg=msg))
+
+
+@app.route('/fund/edit', methods=['POST'])
+def fund_edit():
+    if not session.get('logged_in') or session.get('role') != 'HR':
+        return redirect(url_for('login'))
+    fid = to_int(request.form.get('id'), 0)
+    kind = request.form.get('kind')
+    amount = to_int(request.form.get('amount'), 0)
+    note = (request.form.get('note') or '').strip()[:200]
+    if kind not in ('Deposit', 'Expense') or amount <= 0:
+        return _fund_back('Invalid fund entry.')
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM fund_transactions WHERE id=?", (fid,)).fetchone()
+    if not row:
+        conn.close()
+        return _fund_back('Fund entry not found.')
+    if row['req_id']:
+        conn.close()
+        return _fund_back(f"This entry belongs to Requisition #{row['req_id']}. Change it from the requisition instead.")
+    conn.execute("UPDATE fund_transactions SET kind=?, amount=?, note=? WHERE id=?", (kind, amount, note, fid))
+    if fund_total(conn) < 0:
+        conn.rollback()
+        conn.close()
+        return _fund_back('Not saved: the fund balance would go below zero.')
+    conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)",
+                 (f"Fund entry #{fid} edited: {row['kind']} {row['amount']} -> {kind} {amount}", actor_name()))
+    conn.commit()
+    conn.close()
+    return _fund_back('Fund entry updated.')
+
+
+@app.route('/fund/delete', methods=['POST'])
+def fund_delete():
+    if not session.get('logged_in') or session.get('role') != 'HR':
+        return redirect(url_for('login'))
+    fid = to_int(request.form.get('id'), 0)
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM fund_transactions WHERE id=?", (fid,)).fetchone()
+    if not row:
+        conn.close()
+        return _fund_back('Fund entry not found.')
+    if row['req_id']:
+        conn.close()
+        return _fund_back(f"This entry belongs to Requisition #{row['req_id']}. Change it from the requisition instead.")
+    conn.execute("DELETE FROM fund_transactions WHERE id=?", (fid,))
+    if fund_total(conn) < 0:
+        conn.rollback()
+        conn.close()
+        return _fund_back('Not deleted: the fund balance would go below zero.')
+    recycle_add(conn, 'Fund', fid, f"{row['kind']} {row['amount']}" + (f" - {row['note']}" if row['note'] else ''), dict(row))
+    conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)",
+                 (f"Fund entry #{fid} deleted: {row['kind']} {row['amount']}", actor_name()))
+    conn.commit()
+    conn.close()
+    return _fund_back('Fund entry deleted (kept in the Recycle Bin).')
 
 
 @app.route('/save_theme', methods=['POST'])
