@@ -1,4 +1,3 @@
-from abc import ABC
 from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 import random
@@ -28,47 +27,6 @@ if os.environ.get('VERCEL') == '1':
 DATE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
 
 
-class execute:
-    """Simple command executor with validation and standard result handling."""
-
-    def __init__(self, on_error=None):
-        self.on_error = on_error or self._default_error_handler
-
-    def validate(self, payload):
-        if payload is None:
-            raise ValueError('Payload is required.')
-        if isinstance(payload, dict):
-            return payload
-        if isinstance(payload, (list, tuple)):
-            return {'items': list(payload)}
-        return {'value': payload}
-
-    def run(self, payload):
-        prepared = self.validate(payload)
-        if not isinstance(prepared, dict):
-            raise TypeError('Execution payload must be a dictionary-like object.')
-
-        action = prepared.get('action') or prepared.get('command') or prepared.get('name')
-        if not action:
-            raise ValueError('No action/command name was provided for execution.')
-
-        params = {key: value for key, value in prepared.items() if key not in {'action', 'command', 'name'}}
-        return {'success': True, 'action': action, 'params': params}
-
-    def execute(self, payload):
-        try:
-            normalized = self.validate(payload)
-            result = self.run(normalized)
-            if isinstance(result, dict):
-                result.setdefault('success', True)
-            return result
-        except Exception as exc:
-            return self.on_error(exc, payload)
-
-    def _default_error_handler(self, exc, payload):
-        return {'success': False, 'error': str(exc), 'payload': payload}
-
-
 # ---------------------------------------------------------------------------
 # Helper functions (XSS protection / validation)
 # ---------------------------------------------------------------------------
@@ -144,213 +102,58 @@ def is_full():
     return bool(session.get('logged_in') and (session.get('role') == 'Admin' or is_owner()))
 
 
-REPORT_META = [
-    ('mobile_bill', '📱', 'Monthly Mobile Bill Report', 'Member-wise mobile balance, usage and bill updates for a month'),
-    ('requisition_stats', '📊', 'Monthly Requisition Statistics', 'Approved / pending / rejected counts and type-wise breakdown'),
-    ('user_report', '👤', 'User Management Report', 'All system users, roles, status and new accounts'),
-    ('balance_report', '💰', 'Operator & Balance Report', 'Operator-wise members, balance, usage and low-balance list'),
-    ('activity_report', '🕒', 'Activity Log Report', 'Everything that happened in the system during a month'),
+def actor_name():
+    """Who is doing the action right now (stored in activity_logs.actor)."""
+    return (session.get('user_id') or session.get('user') or 'System') if session.get('logged_in') else 'System'
+
+
+def can_see_all_logs():
+    return session.get('role') == 'HR'
+
+
+# ---------------------------------------------------------------------------
+# ACCESS CONTROL (module permissions) + FUND MANAGEMENT
+# ---------------------------------------------------------------------------
+ACCESS_MODULES = [
+    ('dashboard', '📊', 'Dashboard', 'Overview, charts and quick stats'),
+    ('employees', '👥', 'All Members List', 'View and manage members and balances'),
+    ('requisitions', '📋', 'Office Requisition', 'Create and track requisitions'),
+    ('users', '👤', 'Users', 'Manage system user accounts'),
+    ('reports', '📑', 'Reports', 'Monthly reports and printouts'),
+    ('settings', '⚙️', 'Settings', 'System configuration'),
+    ('activity_log', '🕒', 'Activity Log', 'Own activity history'),
 ]
-
-def column_exists(cursor, table, column):
-    return any(row[1] == column for row in cursor.execute(f"PRAGMA table_info({table})").fetchall())
-
-
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS employees (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            phone TEXT NOT NULL,
-            designation TEXT NOT NULL,
-            operator TEXT NOT NULL,
-            balance INTEGER DEFAULT 0,
-            used INTEGER DEFAULT 0,
-            created_date DATE DEFAULT CURRENT_DATE
-        )
-    ''')
-    # SQLite does not allow ADD COLUMN with a non-constant default, so add plain column then fill it
-    if not column_exists(cursor, 'employees', 'created_date'):
-        cursor.execute("ALTER TABLE employees ADD COLUMN created_date DATE")
-        cursor.execute("UPDATE employees SET created_date = date('now') WHERE created_date IS NULL")
-
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS requisitions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            emp_name TEXT NOT NULL,
-            type TEXT NOT NULL,
-            details TEXT NOT NULL,
-            status TEXT DEFAULT 'Pending',
-            created_date DATE DEFAULT CURRENT_DATE,
-            remark TEXT
-        )
-    ''')
-    if not column_exists(cursor, 'requisitions', 'created_date'):
-        cursor.execute("ALTER TABLE requisitions ADD COLUMN created_date DATE")
-        cursor.execute("UPDATE requisitions SET created_date = date('now') WHERE created_date IS NULL")
-    # Reject remark column (auto-migrates old databases without losing data)
-    if not column_exists(cursor, 'requisitions', 'remark'):
-        cursor.execute("ALTER TABLE requisitions ADD COLUMN remark TEXT")
-
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS app_users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            full_name TEXT NOT NULL,
-            user_id TEXT NOT NULL UNIQUE COLLATE NOCASE,
-            email TEXT UNIQUE COLLATE NOCASE,
-            password_hash TEXT NOT NULL,
-            role TEXT NOT NULL CHECK(role IN ('Admin','HR','Member')),
-            status TEXT NOT NULL DEFAULT 'Active',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            approved_by TEXT,
-            approved_at DATETIME
-        )
-    ''')
-    schema_row = cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='app_users'").fetchone()
-    if schema_row and "'HR'" not in (schema_row[0] or ""):
-        cursor.execute('''
-            CREATE TABLE app_users_new (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                full_name TEXT NOT NULL,
-                user_id TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                email TEXT UNIQUE COLLATE NOCASE,
-                password_hash TEXT NOT NULL,
-                role TEXT NOT NULL CHECK(role IN ('Admin','HR','Member')),
-                status TEXT NOT NULL DEFAULT 'Active',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                approved_by TEXT,
-                approved_at DATETIME
-            )
-        ''')
-        cursor.execute('''INSERT INTO app_users_new
-            (id,full_name,user_id,email,password_hash,role,status,created_at)
-            SELECT id,full_name,user_id,email,password_hash,role,status,created_at FROM app_users''')
-        cursor.execute('DROP TABLE app_users')
-        cursor.execute('ALTER TABLE app_users_new RENAME TO app_users')
-    if not column_exists(cursor, 'app_users', 'approved_by'):
-        cursor.execute("ALTER TABLE app_users ADD COLUMN approved_by TEXT")
-    if not column_exists(cursor, 'app_users', 'approved_at'):
-        cursor.execute("ALTER TABLE app_users ADD COLUMN approved_at DATETIME")
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS activity_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            action TEXT NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    # --- Forgot password / self sign-up: OTP is delivered to HR via notification bell ---
-    if not column_exists(cursor, 'app_users', 'phone'):
-        cursor.execute("ALTER TABLE app_users ADD COLUMN phone TEXT")
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS auth_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            token TEXT NOT NULL UNIQUE,
-            purpose TEXT NOT NULL,
-            full_name TEXT,
-            email TEXT,from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify
-from werkzeug.security import generate_password_hash, check_password_hash
-import random
-import secrets
-import sqlite3
-import os
-import shutil
-import tempfile
-import re
-import json
-import html
-from datetime import datetime as _DT, timedelta as _TD, timezone as _TZ
-
-app = Flask(__name__)
-# NOTE: Production-e environment variable diye set korben (SECRET_KEY, ADMIN_IDENTIFIER, ADMIN_PASSWORD)
-app.secret_key = os.environ.get('SECRET_KEY', 'opsnexus_secret_key')
-
-ADMIN_IDENTIFIER = os.environ.get('ADMIN_IDENTIFIER', "tanvir.hassan7242@gmail.com")
-ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', "T@nv1r#2022")
-
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_NAME = os.path.join(APP_DIR, 'fu_infotech.db')
-if os.environ.get('VERCEL') == '1':
-    DB_NAME = os.path.join(tempfile.gettempdir(), 'fu_infotech.db')
-    if not os.path.exists(DB_NAME):
-        shutil.copy2(os.path.join(APP_DIR, 'fu_infotech.db'), DB_NAME)
-DATE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+ACCESS_DEFAULTS = {
+    'Admin': {'dashboard': 1, 'employees': 1, 'requisitions': 1, 'users': 1, 'reports': 1, 'settings': 1, 'activity_log': 1},
+    'Member': {'dashboard': 1, 'employees': 1, 'requisitions': 1, 'users': 0, 'reports': 0, 'settings': 0, 'activity_log': 1},
+}
+TAB_MODULE = {'overview': 'dashboard', 'employees': 'employees', 'requisitions': 'requisitions', 'users': 'users',
+              'reports': 'reports', 'settings': 'settings', 'activity_log': 'activity_log'}
 
 
-# ---------------------------------------------------------------------------
-# Helper functions (XSS protection / validation)
-# ---------------------------------------------------------------------------
-def esc(value):
-    """HTML escape for text and attribute values."""
-    return html.escape('' if value is None else str(value), quote=True)
-
-
-def js_attr(value):
-    """Safe JS literal to be used inside an HTML attribute (onclick="...")."""
-    return html.escape(json.dumps(value), quote=True)
-
-
-def js_str(value):
-    """Safe JS string literal to be used inside a <script> block."""
-    return json.dumps(value).replace('</', '<\\/')
-
-
-def safe_date(value):
-    value = (value or '').strip()
-    return value if DATE_RE.match(value) else ''
-
-
-def fmt_msg(msg):
-    """Escape message but keep the harmless <b></b> tags used by the app."""
-    m = html.escape(msg or '')
-    return m.replace('&lt;b&gt;', '<b>').replace('&lt;/b&gt;', '</b>')
-
-
-def popup_info(msg):
-    """Return (icon, title, text) for the centered popup, matched to the action."""
-    m = (msg or '').strip()
-    low = m.lower()
-    if low.startswith('error') or low.startswith('invalid') or low == 'requisition not found!':
-        text = m.split(':', 1)[1].strip() if low.startswith('error:') else m
-        return 'error', 'Action Failed!', text
-    if low.startswith('no ') and 'selected' in low:
-        return 'warning', 'Nothing Selected!', m
-    if 'added successfully' in low:
-        return 'success', 'Member Added!', m
-    if low.startswith('balance updated'):
-        return 'success', 'Balance Updated!', m
-    if low.startswith('profile settings'):
-        return 'success', 'Profile Updated!', m
-    if 'submitted successfully' in low:
-        return 'success', 'Requisition Submitted!', m
-    if low.startswith('requisition') and 'rejected' in low:
-        return 'error', 'Requisition Rejected!', m
-    if low.startswith('requisition') and 'approved' in low:
-        return 'success', 'Requisition Approved!', m
-    if low.startswith('requisition') and 'pending' in low:
-        return 'info', 'Status Changed!', m
-    if low.startswith('requisition') and 'updated' in low:
-        return 'success', 'Requisition Updated!', m
-    return 'success', 'Success!', m
-
-
-def to_int(value, default=0):
+def access_map(role):
+    """Return {module: bool} for a role. HR always has full access."""
+    if role == 'HR':
+        return {m[0]: True for m in ACCESS_MODULES}
+    res = {k: bool(v) for k, v in ACCESS_DEFAULTS.get(role, ACCESS_DEFAULTS['Member']).items()}
     try:
-        return int(str(value).strip())
-    except (ValueError, TypeError):
-        return default
+        c = sqlite3.connect(DB_NAME)
+        for mod, allowed in c.execute("SELECT module, allowed FROM access_control WHERE role=?", (role,)).fetchall():
+            if mod in res:
+                res[mod] = bool(allowed)
+        c.close()
+    except sqlite3.Error:
+        pass
+    return res
 
 
-def is_owner():
-    """The fixed owner account: logs in as HR post but has full (admin-level) access."""
-    return bool(session.get('logged_in') and session.get('owner')
-                and (session.get('user') or '').lower() == ADMIN_IDENTIFIER.lower())
+def module_allowed(role, module):
+    return access_map(role).get(module, False)
 
 
-def is_full():
-    """Full access = real Admin role OR the fixed owner (HR post)."""
-    return bool(session.get('logged_in') and (session.get('role') == 'Admin' or is_owner()))
+def fund_total(conn):
+    r = conn.execute("SELECT COALESCE(SUM(CASE WHEN kind='Deposit' THEN amount ELSE -amount END),0) FROM fund_transactions").fetchone()
+    return int(r[0] or 0)
 
 
 REPORT_META = [
@@ -359,6 +162,7 @@ REPORT_META = [
     ('user_report', '👤', 'User Management Report', 'All system users, roles, status and new accounts'),
     ('balance_report', '💰', 'Operator & Balance Report', 'Operator-wise members, balance, usage and low-balance list'),
     ('activity_report', '🕒', 'Activity Log Report', 'Everything that happened in the system during a month'),
+    ('fund_report', '🏦', 'Monthly Fund Report', 'Money added, spent and closing fund balance of the month (HR only)'),
 ]
 
 
@@ -506,6 +310,24 @@ def init_db():
             message TEXT NOT NULL,
             request_id INTEGER,
             is_read INTEGER NOT NULL DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    if not column_exists(cursor, 'activity_logs', 'actor'):
+        cursor.execute("ALTER TABLE activity_logs ADD COLUMN actor TEXT")
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS access_control (
+            role TEXT NOT NULL, module TEXT NOT NULL, allowed INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (role, module)
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS fund_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            note TEXT,
+            created_by TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
@@ -785,6 +607,16 @@ BASE_TEMPLATE = '''
         
         .profile-dropdown { display: none; position: absolute; top: 52px; right: 0; background: #ffffff; min-width: 220px; box-shadow: 0 10px 25px rgba(0,0,0,0.2); border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden; z-index: 99999; }
         .profile-dropdown.show { display: block !important; }
+        .profile-dropdown.show { animation: ddPop .22s ease-out; }
+        @keyframes ddPop { from { opacity: 0; transform: translateY(-8px) scale(.97); } to { opacity: 1; transform: none; } }
+        .profile-dropdown a.dd-anim { opacity: 0; animation: ddSlide .45s cubic-bezier(.2,.8,.2,1) forwards; position: relative; overflow: hidden; }
+        .profile-dropdown a.dd-anim:nth-of-type(1) { animation-delay: .06s; }
+        .profile-dropdown a.dd-anim:nth-of-type(2) { animation-delay: .16s; }
+        @keyframes ddSlide { from { opacity: 0; transform: translateX(-22px); } to { opacity: 1; transform: none; } }
+        .profile-dropdown a.dd-anim::after { content: ""; position: absolute; left: 0; bottom: 0; height: 2px; width: 0; background: linear-gradient(90deg,#2563eb,#06b6d4); transition: width .3s; }
+        .profile-dropdown a.dd-anim:hover::after { width: 100%; }
+        .profile-dropdown a.dd-anim .dd-ico { display: inline-flex; width: 26px; height: 26px; border-radius: 8px; align-items: center; justify-content: center; background: linear-gradient(135deg,#dbeafe,#cffafe); font-size: 14px; }
+
         .dropdown-header-info { padding: 15px; background: #1e293b; color: white; border-bottom: 1px solid #334155; }
         .profile-dropdown a { display: flex; align-items: center; gap: 12px; padding: 12px 16px; color: #334155; text-decoration: none; font-size: 14px; transition: background 0.2s; }
         .profile-dropdown a:hover { background-color: #f1f5f9; }
@@ -841,6 +673,15 @@ BASE_TEMPLATE = '''
             background-image: linear-gradient(rgba(148,163,184,.07) 1px, transparent 1px), linear-gradient(90deg, rgba(148,163,184,.07) 1px, transparent 1px);
             background-size: 56px 56px;
             -webkit-mask-image: radial-gradient(ellipse at center, #000 20%, transparent 72%); mask-image: radial-gradient(ellipse at center, #000 20%, transparent 72%); }
+
+        /* Login: animated digital aurora background */
+        .login-body { background: radial-gradient(1000px 600px at 10% 0%, rgba(59,130,246,.38), transparent 60%), radial-gradient(900px 600px at 100% 100%, rgba(6,182,212,.30), transparent 60%), radial-gradient(700px 500px at 85% 5%, rgba(168,85,247,.22), transparent 60%), linear-gradient(135deg, #050b18 0%, #0b1530 50%, #0a1226 100%) !important; background-size: 140% 140%, 140% 140%, 140% 140%, 100% 100% !important; animation: loginAurora 16s ease-in-out infinite alternate; }
+        @keyframes loginAurora { 0% { background-position: 0% 0%, 100% 100%, 100% 0%, 0 0; } 100% { background-position: 30% 20%, 70% 80%, 70% 30%, 0 0; } }
+        .login-body::after { content: ""; position: absolute; width: 520px; height: 520px; border-radius: 50%; left: -120px; bottom: -160px; z-index: 0; pointer-events: none; background: radial-gradient(circle, rgba(37,99,235,.35), transparent 65%); filter: blur(30px); animation: loginFloat 11s ease-in-out infinite alternate; }
+        @keyframes loginFloat { from { transform: translate(0,0) scale(1); } to { transform: translate(90px,-70px) scale(1.2); } }
+        .login-card { background: rgba(255,255,255,.96) !important; backdrop-filter: blur(14px); border: 1px solid rgba(147,197,253,.35) !important; box-shadow: 0 35px 80px -20px rgba(0,0,0,.75), 0 0 60px -10px rgba(37,99,235,.45) !important; animation: loginCardIn .7s cubic-bezier(.2,.8,.2,1) both; }
+        @keyframes loginCardIn { from { opacity: 0; transform: translateY(24px) scale(.97); } to { opacity: 1; transform: none; } }
+        @media (prefers-reduced-motion: reduce) { .login-body, .login-body::after, .login-card { animation: none; } }
         .login-card input:not([type=checkbox]) { transition: border-color .2s, box-shadow .2s; }
         .login-card input:not([type=checkbox]):focus { outline: none; border-color: #2563eb !important; box-shadow: 0 0 0 3px rgba(37,99,235,.18); }
         .login-card button[type=submit] { background: linear-gradient(135deg, #2563eb, #1d4ed8); box-shadow: 0 6px 14px -4px rgba(37,99,235,.55); font-weight: 600; letter-spacing: .3px; }
@@ -1039,7 +880,7 @@ def login():
                 session['profile_pic'] = ''
                 
                 conn = sqlite3.connect(DB_NAME)
-                conn.execute("INSERT INTO activity_logs (action) VALUES (?)", ("HR (Owner, full access) logged in directly with password",))
+                conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)", ("HR (Owner, full access) logged in directly with password", actor_name()))
                 conn.commit()
                 conn.close()
                 return redirect(url_for('dashboard'))
@@ -1060,8 +901,8 @@ def login():
                     session['user_id'] = account['user_id']
                     session['profile_pic'] = ''
                     log_conn = sqlite3.connect(DB_NAME)
-                    log_conn.execute("INSERT INTO activity_logs (action) VALUES (?)",
-                                     (f"{account['role']} account {account['user_id']} logged in",))
+                    log_conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)",
+                                     (f"{account['role']} account {account['user_id']} logged in", actor_name()))
                     log_conn.commit()
                     log_conn.close()
                     return redirect(url_for('dashboard'))
@@ -1135,7 +976,7 @@ def verify_otp():
             session['profile_pic'] = ''
             
             conn = sqlite3.connect(DB_NAME)
-            conn.execute("INSERT INTO activity_logs (action) VALUES (?)", (f"User logged in as {session['role']}",))
+            conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)", (f"User logged in as {session['role']}", actor_name()))
             conn.commit()
             conn.close()
             return redirect(url_for('dashboard'))
@@ -1513,8 +1354,8 @@ def auth_otp():
                         "VALUES (?,?,?,?,'Member','Active',?,?,CURRENT_TIMESTAMP)",
                         (req['full_name'], new_id, req['email'], req['password_hash'], req['phone'], 'HR OTP verification'))
                     conn.execute("UPDATE auth_requests SET status='used', password_hash=NULL WHERE id=?", (req['id'],))
-                    conn.execute("INSERT INTO activity_logs (action) VALUES (?)",
-                                 (f"New Member account {new_id} created after HR OTP verification",))
+                    conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)",
+                                 (f"New Member account {new_id} created after HR OTP verification", actor_name()))
                     conn.commit()
                 except sqlite3.IntegrityError:
                     conn.rollback()
@@ -1572,8 +1413,8 @@ def auth_new_password():
                     return _auth_dead_end('reset', 'This account is no longer active.')
                 conn.execute("UPDATE app_users SET password_hash=? WHERE id=?", (generate_password_hash(pw), acc['id']))
                 conn.execute("UPDATE auth_requests SET status='used' WHERE id=?", (req['id'],))
-                conn.execute("INSERT INTO activity_logs (action) VALUES (?)",
-                             (f"Password reset for {acc['user_id']} after HR OTP verification",))
+                conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)",
+                             (f"Password reset for {acc['user_id']} after HR OTP verification", actor_name()))
                 conn.commit()
                 session.pop('reset_token', None)
                 inner = ('<div class="auth-ok-icon">&#10003;</div><a class="auth-submit" href="/">Go to login</a>')
@@ -1734,6 +1575,9 @@ def dashboard():
     user_email = session.get('user', 'tanvir@opsnexus.com')
     profile_pic = session.get('profile_pic', '')
     tab = request.args.get('tab', 'overview')
+    _acc = access_map(role)
+    if tab in TAB_MODULE and not _acc.get(TAB_MODULE[tab], False):
+        tab = 'noaccess'
     theme_key = get_user_theme(session.get('user') or session.get('user_id'))
 
     # Escaped versions for safe HTML output
@@ -1773,12 +1617,49 @@ def dashboard():
     else:
         requisitions = conn.execute("SELECT * FROM requisitions").fetchall()
         
-    logs = conn.execute("SELECT * FROM activity_logs ORDER BY id DESC LIMIT 15").fetchall()
+    if can_see_all_logs():
+        logs = conn.execute("SELECT * FROM activity_logs ORDER BY id DESC LIMIT 300").fetchall()
+    else:
+        logs = conn.execute("SELECT * FROM activity_logs WHERE actor=? ORDER BY id DESC LIMIT 300", (actor_name(),)).fetchall()
+    _fund_total = fund_total(conn)
+    _cur_sym = esc(load_settings().get('currency_symbol', '৳'))
     
     total_balance = sum(emp['balance'] for emp in employees)
     total_used = sum(emp['used'] for emp in employees)
     total_employees = len(employees)
     total_requisitions = len(requisitions)
+    if role == 'HR':
+        hr_cards_members = f'''<div class="metric-card">
+                <div class="metric-icon" style="background: #fee2e2; color: #dc2626;">💰</div>
+                <div class="metric-info">
+                    <h3>Total Cost Balance</h3>
+                    <div class="val" style="color: #dc2626;">{_cur_sym}{total_balance}</div>
+                </div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-icon" style="background: #fef3c7; color: #d97706;">⚠️</div>
+                <div class="metric-info">
+                    <h3>Need Balance</h3>
+                    <div class="val" style="color: #d97706;">{_cur_sym}0</div>
+                </div>
+            </div>'''
+        hr_cards_req = f'''<div class="metric-card">
+                <div class="metric-icon" style="background: #fee2e2; color: #dc2626;">💰</div>
+                <div class="metric-info">
+                    <h3>Total Cost Balance</h3>
+                    <div class="val" style="color: #dc2626;">{_cur_sym}{total_balance}</div>
+                </div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-icon" style="background: #dcfce7; color: #059669;">🏦</div>
+                <div class="metric-info">
+                    <h3>Total Balance</h3>
+                    <div class="val" style="color: #059669;">{_cur_sym}{_fund_total}</div>
+                </div>
+            </div>'''
+    else:
+        hr_cards_members = ''
+        hr_cards_req = ''
     approved_requisitions = len([r for r in requisitions if r['status'] == 'Approved'])
     conn.close()
     
@@ -2184,20 +2065,7 @@ def dashboard():
                     <div class="val">{total_employees}</div>
                 </div>
             </div>
-            <div class="metric-card">
-                <div class="metric-icon" style="background: #fee2e2; color: #dc2626;">💰</div>
-                <div class="metric-info">
-                    <h3>Total Cost Balance</h3>
-                    <div class="val" style="color: #dc2626;">৳{total_balance}</div>
-                </div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-icon" style="background: #fef3c7; color: #d97706;">⚠️</div>
-                <div class="metric-info">
-                    <h3>Need Balance</h3>
-                    <div class="val" style="color: #d97706;">৳0</div>
-                </div>
-            </div>
+            {hr_cards_members}
         </div>
         '''
 
@@ -2470,20 +2338,7 @@ def dashboard():
                     <div class="val">{approved_requisitions}</div>
                 </div>
             </div>
-            <div class="metric-card">
-                <div class="metric-icon" style="background: #fee2e2; color: #dc2626;">💰</div>
-                <div class="metric-info">
-                    <h3>Total Cost Balance</h3>
-                    <div class="val" style="color: #dc2626;">৳{total_balance}</div>
-                </div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-icon" style="background: #fef3c7; color: #d97706;">⚠️</div>
-                <div class="metric-info">
-                    <h3>Need Balance</h3>
-                    <div class="val" style="color: #d97706;">৳0</div>
-                </div>
-            </div>
+            {hr_cards_req}
         </div>
         '''
 
@@ -2827,25 +2682,88 @@ def dashboard():
     elif tab == 'activity_log':
         log_rows = ""
         for log in logs:
-            log_rows += f'<tr><td>{esc(log["timestamp"])}</td><td>{esc(log["action"])}</td></tr>'
-            
+            if can_see_all_logs():
+                log_rows += f'<tr><td>{esc(log["timestamp"])}</td><td>{esc(log["actor"] or "System")}</td><td>{esc(log["action"])}</td></tr>'
+            else:
+                log_rows += f'<tr><td>{esc(log["timestamp"])}</td><td>{esc(log["action"])}</td></tr>'
+        _log_head = '<th>Timestamp</th><th>User</th><th>Activity Description</th>' if can_see_all_logs() else '<th>Timestamp</th><th>Activity Description</th>'
+        _log_cols = 3 if can_see_all_logs() else 2
+        _log_sub = 'All users\' activities (visible to HR only).' if can_see_all_logs() else 'Only your own activities are shown here.'
+
         content_area = f'''
         <div class="panel">
             <h3>📜 System Activity Log</h3>
-            <p style="color: #64748b; margin-bottom: 15px;">Recent system actions and user activities.</p>
+            <p style="color: #64748b; margin-bottom: 15px;">{_log_sub}</p>
             <table>
                 <thead>
-                    <tr>
-                        <th>Timestamp</th>
-                        <th>Activity Description</th>
-                    </tr>
+                    <tr>{_log_head}</tr>
                 </thead>
                 <tbody>
-                    {log_rows if log_rows else '<tr><td colspan="2">No logs found.</td></tr>'}
+                    {log_rows if log_rows else f'<tr><td colspan="{_log_cols}">No logs found.</td></tr>'}
                 </tbody>
             </table>
         </div>
         '''
+
+    elif tab == 'noaccess':
+        content_area = '<div class="panel" style="text-align:center;padding:50px"><div style="font-size:46px">🔒</div><h2 style="margin:10px 0 4px">Access Denied</h2><p style="color:#64748b">You do not have permission to open this module. Please contact HR.</p></div>'
+
+    elif tab == 'access':
+        _is_hr = (role == 'HR')
+        _roles = ['Admin', 'Member']
+        _maps = {r: access_map(r) for r in _roles}
+        _cards = ''
+        for i, (mk, ic, title, desc) in enumerate(ACCESS_MODULES):
+            if _is_hr:
+                _tg = ''.join(
+                    f'<div class="ac-role"><span>{r}</span><label class="ac-switch"><input type="checkbox" {"checked" if _maps[r][mk] else ""} onchange="acToggle(this,\'{r}\',\'{mk}\')"><i></i></label></div>'
+                    for r in _roles)
+                _tg += '<div class="ac-role locked"><span>HR</span><b>🔒 Full</b></div>'
+            else:
+                _on = _acc.get(mk, False)
+                _tg = f'<div class="ac-role locked"><span>Your access</span><b class="{"ok" if _on else "no"}">{"✔ Allowed" if _on else "✖ Blocked"}</b></div>'
+            _cards += f'<div class="ac-card" style="animation-delay:{i*0.07}s"><div class="ac-ico">{ic}</div><div class="ac-title">{esc(title)}</div><div class="ac-desc">{esc(desc)}</div><div class="ac-roles">{_tg}</div></div>'
+        _sub = 'Choose which modules each role can open. Changes apply instantly.' if _is_hr else 'These are the modules currently available to your account.'
+        _reset = '<button class="ac-reset" onclick="acReset()">↺ Reset to default</button>' if _is_hr else ''
+        content_area = """<style>
+        .ac-wrap{background:radial-gradient(800px 300px at 0% 0%,rgba(37,99,235,.35),transparent 60%),linear-gradient(135deg,#0b1220,#0f1b36);border-radius:16px;padding:26px;color:#e2e8f0;box-shadow:0 20px 50px -20px rgba(2,6,23,.7);position:relative;overflow:hidden}
+        .ac-wrap::before{content:"";position:absolute;inset:0;background-image:linear-gradient(rgba(148,163,184,.07) 1px,transparent 1px),linear-gradient(90deg,rgba(148,163,184,.07) 1px,transparent 1px);background-size:38px 38px;pointer-events:none}
+        .ac-head{position:relative;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:22px}
+        .ac-head h2{margin:0;font-size:22px;color:#fff;letter-spacing:.5px}
+        .ac-head p{margin:4px 0 0;color:#93a4c0;font-size:13px}
+        .ac-pulse{display:inline-block;width:9px;height:9px;border-radius:50%;background:#22d3ee;box-shadow:0 0 0 0 rgba(34,211,238,.7);animation:acPulse 1.8s infinite;margin-right:8px}
+        @keyframes acPulse{70%{box-shadow:0 0 0 10px rgba(34,211,238,0)}100%{box-shadow:0 0 0 0 rgba(34,211,238,0)}}
+        .ac-reset{background:rgba(255,255,255,.08);color:#e2e8f0;border:1px solid rgba(255,255,255,.18);padding:8px 14px;border-radius:8px;cursor:pointer;font-size:13px}
+        .ac-reset:hover{background:rgba(34,211,238,.18);border-color:#22d3ee}
+        .ac-grid{position:relative;display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}
+        .ac-card{background:rgba(15,27,54,.75);border:1px solid rgba(96,165,250,.25);border-radius:14px;padding:18px;backdrop-filter:blur(6px);animation:acIn .5s ease both;transition:transform .25s,box-shadow .25s,border-color .25s}
+        .ac-card:hover{transform:translateY(-4px);border-color:#22d3ee;box-shadow:0 0 28px -6px rgba(34,211,238,.55)}
+        @keyframes acIn{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+        .ac-ico{font-size:28px;width:50px;height:50px;border-radius:12px;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,rgba(37,99,235,.45),rgba(6,182,212,.35));box-shadow:0 0 18px rgba(37,99,235,.5)}
+        .ac-title{font-weight:700;font-size:16px;margin-top:12px;color:#fff}
+        .ac-desc{font-size:12px;color:#93a4c0;margin:4px 0 14px;min-height:30px}
+        .ac-roles{border-top:1px dashed rgba(148,163,184,.25);padding-top:10px}
+        .ac-role{display:flex;justify-content:space-between;align-items:center;padding:6px 0;font-size:13px;color:#cbd5e1}
+        .ac-role.locked b{font-size:12px;color:#7dd3fc}.ac-role b.ok{color:#4ade80}.ac-role b.no{color:#f87171}
+        .ac-switch{position:relative;width:46px;height:24px;display:inline-block}
+        .ac-switch input{opacity:0;width:0;height:0}
+        .ac-switch i{position:absolute;inset:0;background:#334155;border-radius:24px;cursor:pointer;transition:.3s}
+        .ac-switch i::before{content:"";position:absolute;width:18px;height:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.3s}
+        .ac-switch input:checked+i{background:linear-gradient(90deg,#2563eb,#06b6d4);box-shadow:0 0 12px rgba(6,182,212,.7)}
+        .ac-switch input:checked+i::before{transform:translateX(22px)}
+        .ac-toast{position:fixed;right:24px;bottom:24px;background:#0f172a;color:#e2e8f0;border:1px solid #22d3ee;padding:10px 16px;border-radius:10px;font-size:13px;opacity:0;transform:translateY(10px);transition:.3s;z-index:9999;pointer-events:none}
+        .ac-toast.show{opacity:1;transform:none}
+        </style>
+        <div class="ac-wrap">
+          <div class="ac-head"><div><h2><span class="ac-pulse"></span>ACCESS CONTROL</h2><p>""" + _sub + """</p></div>""" + _reset + """</div>
+          <div class="ac-grid">""" + _cards + """</div>
+        </div>
+        <div class="ac-toast" id="acToast"></div>
+        <script>
+        function acToast(t){var e=document.getElementById('acToast');e.textContent=t;e.classList.add('show');setTimeout(function(){e.classList.remove('show')},1800)}
+        function acToggle(el,role,mod){fetch('/access/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({role:role,module:mod,allowed:el.checked})}).then(function(r){return r.json()}).then(function(d){if(d.ok){acToast('Saved: '+role+' → '+mod+' '+(el.checked?'ON':'OFF'))}else{el.checked=!el.checked;acToast('Not allowed')}}).catch(function(){el.checked=!el.checked;acToast('Error')})}
+        function acReset(){if(!confirm('Reset all permissions to default?'))return;fetch('/access/reset',{method:'POST'}).then(function(){location.reload()})}
+        </script>"""
 
     elif tab == 'theme':
         content_area = theme_picker_html(theme_key)
@@ -2861,7 +2779,7 @@ def dashboard():
                     <div class="rf-emoji">{ic}</div>
                     <div class="rf-title">{esc(title)}</div>
                     <div class="rf-desc">{esc(desc)}</div>
-                </a>''' for i, (k, ic, title, desc) in enumerate(REPORT_META, 1))
+                </a>''' for i, (k, ic, title, desc) in enumerate([m for m in REPORT_META if m[0] != 'fund_report' or role == 'HR'], 1))
             content_area = """<style>
             .report-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:18px;margin-top:18px}
             .report-folder{position:relative;display:block;background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:22px 20px;text-decoration:none;color:#1e293b;box-shadow:0 1px 3px rgba(0,0,0,.05);transition:transform .3s ease,box-shadow .3s ease,border-color .3s ease;animation:rfIn .6s ease both}
@@ -2911,6 +2829,45 @@ def dashboard():
             <div class="settings-extra">{extra}</div>
         </div>'''
 
+
+    if tab == 'settings' and request.args.get('section') == 'fund':
+        settings = load_settings()
+        if role != 'HR':
+            content_area = '<div class="panel"><h3>Access denied</h3><p>Only HR can manage the fund.</p></div>'
+        else:
+            _fc = sqlite3.connect(DB_NAME)
+            _fc.row_factory = sqlite3.Row
+            _ftotal = fund_total(_fc)
+            _dep = _fc.execute("SELECT COALESCE(SUM(amount),0) FROM fund_transactions WHERE kind='Deposit'").fetchone()[0]
+            _exp = _fc.execute("SELECT COALESCE(SUM(amount),0) FROM fund_transactions WHERE kind='Expense'").fetchone()[0]
+            _frows = _fc.execute("SELECT * FROM fund_transactions ORDER BY id DESC LIMIT 50").fetchall()
+            _fc.close()
+            _cs = esc(settings.get('currency_symbol', '৳'))
+            _trs = ''.join(
+                f'<tr><td>{esc(r["created_at"])}</td><td><span style="padding:3px 9px;border-radius:20px;font-size:11px;font-weight:700;{"background:#dcfce7;color:#15803d" if r["kind"]=="Deposit" else "background:#fee2e2;color:#b91c1c"}">{esc(r["kind"])}</span></td><td>{_cs}{r["amount"]}</td><td>{esc(r["note"] or "-")}</td><td>{esc(r["created_by"] or "-")}</td></tr>'
+                for r in _frows) or '<tr><td colspan="5" style="text-align:center;color:#64748b">No fund entries yet.</td></tr>'
+            content_area = f"""<style>
+            .fund-top{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-bottom:18px}}
+            .fund-box{{border-radius:14px;padding:18px;color:#fff;box-shadow:0 10px 24px -12px rgba(0,0,0,.4)}}
+            .fund-box small{{opacity:.85;font-size:12px;letter-spacing:.5px}}.fund-box div{{font-size:26px;font-weight:800;margin-top:4px}}
+            .fund-form{{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:18px;margin-bottom:18px;display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}}
+            .fund-form label{{display:block;font-size:12px;font-weight:600;color:#334155;margin-bottom:5px}}
+            .fund-form input,.fund-form select{{padding:10px;border:1px solid #cbd5e1;border-radius:7px}}
+            </style>
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:18px"><span style="font-size:25px">🏦</span><div><h2 style="margin:0;color:#1e293b">Fund Management</h2><p style="margin:3px 0 0;color:#64748b;font-size:13px">Record how much money you have in the fund.</p></div></div>
+            <div class="fund-top">
+              <div class="fund-box" style="background:linear-gradient(135deg,#059669,#10b981)"><small>TOTAL BALANCE (AVAILABLE)</small><div>{_cs}{_ftotal}</div></div>
+              <div class="fund-box" style="background:linear-gradient(135deg,#2563eb,#06b6d4)"><small>TOTAL ADDED</small><div>{_cs}{_dep}</div></div>
+              <div class="fund-box" style="background:linear-gradient(135deg,#dc2626,#f97316)"><small>TOTAL SPENT</small><div>{_cs}{_exp}</div></div>
+            </div>
+            <form class="fund-form" method="POST" action="/fund/add">
+              <div><label>Type</label><select name="kind"><option value="Deposit">➕ Add money</option><option value="Expense">➖ Spend / Withdraw</option></select></div>
+              <div><label>Amount</label><input type="number" name="amount" min="1" required placeholder="0"></div>
+              <div style="flex:1;min-width:180px"><label>Note</label><input type="text" name="note" placeholder="Source / reason" style="width:100%"></div>
+              <button type="submit">Save</button>
+            </form>
+            <div class="panel"><h3>Recent fund entries</h3><table><thead><tr><th>Date</th><th>Type</th><th>Amount</th><th>Note</th><th>By</th></tr></thead><tbody>{_trs}</tbody></table></div>"""
+
     notif_bell_html = HR_BELL_HTML if role == 'HR' else ''
     if role == 'HR':
         try:
@@ -2944,7 +2901,8 @@ def dashboard():
                     <div class="d-name">{name_e}</div>
                     <div class="d-email">{user_email_e}</div>
                 </div>
-                <a href="/dashboard?tab=profile">👤 Profile</a>
+                <a href="/dashboard?tab=profile" class="dd-anim"><span class="dd-ico">👤</span> User Profile</a>
+                <a href="/dashboard?tab=access" class="dd-anim"><span class="dd-ico">🛡️</span> Access Control</a>
                 <a href="/dashboard?tab=activity_log">🕒 Activity Log</a>
                 <a href="/dashboard?tab=theme">🎨 Theme</a>
                 <a href="/logout" class="logout-btn">🔴 Logout</a>
@@ -2959,7 +2917,7 @@ def dashboard():
             <a href="/dashboard?tab=requisitions" class="{'active' if tab == 'requisitions' else ''}">📋 Office Requisition <span>›</span></a>
             {('<a href="/dashboard?tab=users" class="' + ('active' if tab == 'users' else '') + '">👤 Users <span>›</span></a>') if role in ['Admin', 'HR'] else ''}
             <a href="/dashboard?tab=settings" class=""{'active' if tab == 'settings' else ''}" aria-expanded="{'true' if tab == 'settings' else 'false'}">⚙️ Settings <span>{'⌄' if tab == 'settings' else '›'}</span></a>
-            {('<div class="settings-drawer">' + ''.join(f'<a class="settings-drawer-item {"current" if request.args.get("section", "general") == k else ""}" href="/dashboard?tab=settings&section={k}"><span class="settings-drawer-arrow">›</span><span>{esc(v)}</span></a>' for i,(k,v) in enumerate([('general','General / Company'),('operator','Operator & Recharge'),('member','Member Settings'),('requisition','Requisition Settings'),('roles','Role & Permission'),('security','Security'),('notifications','Notifications'),('activity','Activity Log'),('backup','Data & Backup'),('print','Print Settings'),('theme','Theme / Display')],1)) + '</div>') if tab == 'settings' and is_full() else ''}
+            {('<div class="settings-drawer">' + ''.join(f'<a class="settings-drawer-item {"current" if request.args.get("section", "general") == k else ""}" href="/dashboard?tab=settings&section={k}"><span class="settings-drawer-arrow">›</span><span>{esc(v)}</span></a>' for i,(k,v) in enumerate([('general','General / Company'),('operator','Operator & Recharge'),('member','Member Settings'),('requisition','Requisition Settings'),('roles','Role & Permission'),('security','Security'),('notifications','Notifications'),('activity','Activity Log'),('backup','Data & Backup'),('print','Print Settings'),('theme','Theme / Display'),('fund','Fund Management')],1)) + '</div>') if tab == 'settings' and is_full() else ''}
             {('<a href="/dashboard?tab=reports" class="' + ('active' if tab == 'reports' else '') + '">📑 Report <span>›</span></a>') if role in ['Admin', 'HR'] else ''}
         </div>
         <div class="main-content">
@@ -2967,6 +2925,14 @@ def dashboard():
         </div>
     </div>
     ''' + popup_action_js
+    for _mod, _pat in (('employees', r'<a href="/dashboard\?tab=employees"[^>]*>.*?</a>'),
+                       ('requisitions', r'<a href="/dashboard\?tab=requisitions"[^>]*>.*?</a>'),
+                       ('users', r'<a href="/dashboard\?tab=users"[^>]*>.*?</a>'),
+                       ('reports', r'<a href="/dashboard\?tab=reports"[^>]*>.*?</a>'),
+                       ('settings', r'<a href="/dashboard\?tab=settings"[^>]*>.*?</a>'),
+                       ('dashboard', r'<a href="/dashboard\?tab=overview"[^>]*>\s*📊 Dashboard.*?</a>')):
+        if not _acc.get(_mod, False):
+            body_content = re.sub(_pat, '', body_content, count=1, flags=re.S)
     return render_template_string(BASE_TEMPLATE, title="Dashboard - OpsNexus", content=body_content, theme_key=theme_key, theme_head=build_theme_head(theme_key))
 
 @app.route('/create_user', methods=['POST'])
@@ -2989,8 +2955,8 @@ def create_user():
     try:
         conn.execute("INSERT INTO app_users (full_name,user_id,email,password_hash,role,status) VALUES (?,?,?,?,?,'Pending')",
                      (full_name, user_id, email, generate_password_hash(password), new_role))
-        conn.execute("INSERT INTO activity_logs (action) VALUES (?)",
-                     (f"{actor_role} created {new_role} account awaiting HR approval: {user_id}",))
+        conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)",
+                     (f"{actor_role} created {new_role} account awaiting HR approval: {user_id}", actor_name()))
         conn.commit()
     except sqlite3.IntegrityError:
         conn.rollback()
@@ -3045,7 +3011,7 @@ def edit_user():
         if cur.rowcount != 1:
             conn.rollback()
             return redirect(url_for('dashboard', tab='users', success_msg='User not found.'))
-        conn.execute("INSERT INTO activity_logs (action) VALUES (?)", (f"{actor_role} edited user profile ID {target_id}",))
+        conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)", (f"{actor_role} edited user profile ID {target_id}", actor_name()))
         conn.commit()
     except sqlite3.IntegrityError:
         conn.rollback()
@@ -3063,7 +3029,7 @@ def approve_user(user_id):
     cur = conn.execute("UPDATE app_users SET status='Active',approved_by=?,approved_at=CURRENT_TIMESTAMP WHERE id=? AND status='Pending'",
                        (session.get('name') or session.get('user'), user_id))
     if cur.rowcount:
-        conn.execute("INSERT INTO activity_logs (action) VALUES (?)", (f"HR approved user account ID {user_id}",))
+        conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)", (f"HR approved user account ID {user_id}", actor_name()))
     conn.commit()
     conn.close()
     return redirect(url_for('dashboard', tab='users', success_msg='User approved and can now log in.' if cur.rowcount else 'Pending user was not found.'))
@@ -3076,7 +3042,7 @@ def reject_user(user_id):
     conn = sqlite3.connect(DB_NAME)
     cur = conn.execute("UPDATE app_users SET status='Rejected' WHERE id=? AND status='Pending'", (user_id,))
     if cur.rowcount:
-        conn.execute("INSERT INTO activity_logs (action) VALUES (?)", (f"HR rejected user account ID {user_id}",))
+        conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)", (f"HR rejected user account ID {user_id}", actor_name()))
     conn.commit()
     conn.close()
     return redirect(url_for('dashboard', tab='users', success_msg='User request rejected.' if cur.rowcount else 'Pending user was not found.'))
@@ -3110,7 +3076,7 @@ def delete_user(user_id):
     snap = {k: full_row[k] for k in full_row.keys() if k != 'password_hash'}
     recycle_add(conn, 'User', user_id, f"{full_row['full_name']} ({t_uid})", snap)
     conn.execute("DELETE FROM app_users WHERE id=?", (user_id,))
-    conn.execute("INSERT INTO activity_logs (action) VALUES (?)", (f"{actor_role} deleted user account {t_uid} (ID {user_id})",))
+    conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)", (f"{actor_role} deleted user account {t_uid} (ID {user_id})", actor_name()))
     conn.commit()
     conn.close()
     return redirect(url_for('dashboard', tab='users', success_msg=f'User {t_uid} deleted successfully.'))
@@ -3173,7 +3139,7 @@ def update_profile():
         if new_role in ['HR', 'Admin', 'Member']:
             session['role'] = new_role
     conn = sqlite3.connect(DB_NAME)
-    conn.execute("INSERT INTO activity_logs (action) VALUES (?)", ("Updated profile settings",))
+    conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)", ("Updated profile settings", actor_name()))
     conn.commit()
     conn.close()
     return redirect(url_for('dashboard', tab='profile', success_msg="Profile settings updated successfully!"))
@@ -3221,7 +3187,7 @@ def add_employee():
             return redirect(url_for('dashboard', tab='employees', success_msg='Error: This phone number already exists!'))
     conn.execute("INSERT INTO employees (name, phone, designation, operator, balance, used, created_date) VALUES (?, ?, ?, ?, ?, 0, CURRENT_DATE)",
                  (name, phone, designation, operator, balance))
-    conn.execute("INSERT INTO activity_logs (action) VALUES (?)", (f"New member added: {name} ({phone})",))
+    conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)", (f"New member added: {name} ({phone})", actor_name()))
     conn.commit()
     conn.close()
     return redirect(url_for('dashboard', tab='employees', success_msg=f"New member '{name}' added successfully!"))
@@ -3238,7 +3204,7 @@ def delete_member(emp_id):
     if emp:
         recycle_add(conn, 'Member', emp['id'], emp['name'], dict(emp))
         conn.execute("DELETE FROM employees WHERE id = ?", (emp_id,))
-        conn.execute("INSERT INTO activity_logs (action) VALUES (?)", (f"Deleted member: {emp['name']}",))
+        conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)", (f"Deleted member: {emp['name']}", actor_name()))
         conn.commit()
         msg = f"Member <b>'{emp['name']}'</b> has been moved to the recycle bin."
     else:
@@ -3260,7 +3226,7 @@ def bulk_delete_members():
         for _r in conn.execute(f"SELECT * FROM employees WHERE id IN ({placeholders})", emp_ids).fetchall():
             recycle_add(conn, 'Member', _r['id'], _r['name'], dict(_r))
         conn.execute(f"DELETE FROM employees WHERE id IN ({placeholders})", emp_ids)
-        conn.execute("INSERT INTO activity_logs (action) VALUES (?)", (f"Bulk deleted {len(emp_ids)} members",))
+        conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)", (f"Bulk deleted {len(emp_ids)} members", actor_name()))
         conn.commit()
         conn.close()
         return redirect(url_for('dashboard', tab='employees', delete_msg=f"Successfully moved <b>{len(emp_ids)}</b> selected member(s) to the recycle bin!"))
@@ -3278,7 +3244,7 @@ def delete_requisition(req_id):
     if _r:
         recycle_add(conn, 'Requisition', _r['id'], f"Requisition #{_r['id']} - {_r['type']} ({_r['emp_name']})", dict(_r))
     conn.execute("DELETE FROM requisitions WHERE id = ?", (req_id,))
-    conn.execute("INSERT INTO activity_logs (action) VALUES (?)", (f"Deleted requisition #{req_id}",))
+    conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)", (f"Deleted requisition #{req_id}", actor_name()))
     conn.commit()
     conn.close()
     return redirect(url_for('dashboard', tab='requisitions', delete_msg=f"Requisition <b>#{req_id}</b> has been moved to the recycle bin."))
@@ -3296,7 +3262,7 @@ def bulk_delete_requisitions():
         for _r in conn.execute(f"SELECT * FROM requisitions WHERE id IN ({placeholders})", req_ids).fetchall():
             recycle_add(conn, 'Requisition', _r['id'], f"Requisition #{_r['id']} - {_r['type']} ({_r['emp_name']})", dict(_r))
         conn.execute(f"DELETE FROM requisitions WHERE id IN ({placeholders})", req_ids)
-        conn.execute("INSERT INTO activity_logs (action) VALUES (?)", (f"Bulk deleted {len(req_ids)} requisitions",))
+        conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)", (f"Bulk deleted {len(req_ids)} requisitions", actor_name()))
         conn.commit()
         conn.close()
         return redirect(url_for('dashboard', tab='requisitions', delete_msg=f"Successfully moved <b>{len(req_ids)}</b> selected requisition(s) to the recycle bin!"))
@@ -3314,7 +3280,7 @@ def update_balance():
     emp = conn.execute("SELECT * FROM employees WHERE id = ?", (emp_id,)).fetchone()
     if emp:
         conn.execute("UPDATE employees SET balance = ? WHERE id = ?", (new_balance, emp_id))
-        conn.execute("INSERT INTO activity_logs (action) VALUES (?)", (f"Updated balance for {emp['name']} to ৳{new_balance}",))
+        conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)", (f"Updated balance for {emp['name']} to ৳{new_balance}", actor_name()))
         conn.commit()
     conn.close()
     return redirect(url_for('dashboard', tab='employees', success_msg=f"Balance updated successfully for {emp['name'] if emp else 'Member'}!"))
@@ -3543,7 +3509,7 @@ def add_requisition():
         cursor.execute("CREATE TABLE IF NOT EXISTS requisitions (id INTEGER PRIMARY KEY AUTOINCREMENT, emp_name TEXT NOT NULL, type TEXT NOT NULL, details TEXT NOT NULL, status TEXT DEFAULT 'Pending', created_date DATE DEFAULT CURRENT_DATE, remark TEXT)")
         cursor.execute("INSERT INTO requisitions (emp_name, type, details, status, created_date) VALUES (?, ?, ?, 'Pending', CURRENT_DATE)",
                      (user, req_type, details))
-    conn.execute("INSERT INTO activity_logs (action) VALUES (?)", (f"User submitted a requisition for {req_type}",))
+    conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)", (f"User submitted a requisition for {req_type}", actor_name()))
     conn.commit()
     conn.close()
     return redirect(url_for('dashboard', tab='requisitions', success_msg="Requisition submitted successfully!"))
@@ -3557,7 +3523,7 @@ def update_requisition_details():
     details = request.form.get('details')
     conn = sqlite3.connect(DB_NAME)
     conn.execute("UPDATE requisitions SET type = ?, details = ? WHERE id = ?", (req_type, details, req_id))
-    conn.execute("INSERT INTO activity_logs (action) VALUES (?)", (f"Updated requisition #{req_id}",))
+    conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)", (f"Updated requisition #{req_id}", actor_name()))
     conn.commit()
     conn.close()
     return redirect(url_for('dashboard', tab='requisitions', success_msg=f"Requisition #{req_id} updated successfully!"))
@@ -3574,7 +3540,7 @@ def update_requisition(req_id, status):
         return redirect(url_for('dashboard', tab='requisitions', success_msg="Invalid status!"))
     conn = sqlite3.connect(DB_NAME)
     conn.execute("UPDATE requisitions SET status = ?, remark = NULL WHERE id = ?", (status, req_id))
-    conn.execute("INSERT INTO activity_logs (action) VALUES (?)", (f"Marked requisition #{req_id} as {status}",))
+    conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)", (f"Marked requisition #{req_id} as {status}", actor_name()))
     conn.commit()
     conn.close()
     return redirect(url_for('dashboard', tab='requisitions', success_msg=f"Requisition has been {status.lower()}!"))
@@ -3596,7 +3562,7 @@ def reject_requisition():
         return redirect(url_for('dashboard', tab='requisitions', success_msg="Requisition not found!"))
 
     conn.execute("UPDATE requisitions SET status = 'Rejected', remark = ? WHERE id = ?", (remark, req_id))
-    conn.execute("INSERT INTO activity_logs (action) VALUES (?)", (f"Rejected requisition #{req_id} with remark: {remark}",))
+    conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)", (f"Rejected requisition #{req_id} with remark: {remark}", actor_name()))
     conn.commit()
     conn.close()
     return redirect(url_for('dashboard', tab='requisitions', success_msg=f"Requisition #{req_id} has been rejected!"))
@@ -3790,13 +3756,29 @@ def report_view(kind):
                          'rows': [[e['name'], e['phone'], e['operator'], f"{cur}{e['balance'] or 0}"] for e in low]})
 
     elif kind == 'activity_report':
-        logs = conn.execute("SELECT * FROM activity_logs WHERE substr(timestamp,1,7)=? ORDER BY id DESC LIMIT 1000", (month,)).fetchall()
+        if session.get('role') == 'HR':
+            logs = conn.execute("SELECT * FROM activity_logs WHERE substr(timestamp,1,7)=? ORDER BY id DESC LIMIT 1000", (month,)).fetchall()
+        else:
+            logs = conn.execute("SELECT * FROM activity_logs WHERE substr(timestamp,1,7)=? AND actor=? ORDER BY id DESC LIMIT 1000", (month, actor_name())).fetchall()
         days = {}
         for l in logs: days[(l['timestamp'] or '')[:10]] = days.get((l['timestamp'] or '')[:10], 0) + 1
         cards = [('Total Activities', len(logs)), ('Active Days', len(days))]
-        sections.append({'heading': '1. Activity Log', 'headers': ['Date & Time', 'Action'],
-                         'rows': [[l['timestamp'], l['action']] for l in logs],
+        _hr_view = session.get('role') == 'HR'
+        sections.append({'heading': '1. Activity Log', 'headers': ['Date & Time', 'User', 'Action'] if _hr_view else ['Date & Time', 'Action'],
+                         'rows': [[l['timestamp'], l['actor'] or 'System', l['action']] for l in logs] if _hr_view else [[l['timestamp'], l['action']] for l in logs],
                          'note': 'Shows up to the latest 1000 entries of the month.'})
+
+    elif kind == 'fund_report':
+        if session.get('role') != 'HR':
+            conn.close()
+            return "Only HR can view the fund report", 403
+        opening = conn.execute("SELECT COALESCE(SUM(CASE WHEN kind='Deposit' THEN amount ELSE -amount END),0) FROM fund_transactions WHERE substr(created_at,1,7) < ?", (month,)).fetchone()[0]
+        added = conn.execute("SELECT COALESCE(SUM(amount),0) FROM fund_transactions WHERE kind='Deposit' AND substr(created_at,1,7)=?", (month,)).fetchone()[0]
+        spent = conn.execute("SELECT COALESCE(SUM(amount),0) FROM fund_transactions WHERE kind='Expense' AND substr(created_at,1,7)=?", (month,)).fetchone()[0]
+        txs = conn.execute("SELECT * FROM fund_transactions WHERE substr(created_at,1,7)=? ORDER BY id", (month,)).fetchall()
+        cards = [('Opening Balance', f"{cur}{opening}"), ('Money Added', f"{cur}{added}"), ('Money Spent', f"{cur}{spent}"), ('Closing Balance', f"{cur}{opening + added - spent}")]
+        sections.append({'heading': '1. Fund Transactions', 'headers': ['Date & Time', 'Type', 'Amount', 'Note', 'By'],
+                         'rows': [[t['created_at'], t['kind'], f"{cur}{t['amount']}", t['note'] or '-', t['created_by'] or '-'] for t in txs]})
     conn.close()
 
     return render_template_string(
@@ -3806,6 +3788,55 @@ def report_view(kind):
         show_prepared=st.get('show_prepared_by', True), show_approved=st.get('show_approved_by', True),
         generated=datetime.datetime.now().strftime('%d-%m-%Y %H:%M'), prepared_by=session.get('name', ''),
         cards=cards, sections=sections)
+
+
+
+@app.route('/access/toggle', methods=['POST'])
+def access_toggle():
+    if not session.get('logged_in') or session.get('role') != 'HR':
+        return jsonify(ok=False), 403
+    d = request.get_json(silent=True) or {}
+    role_, mod, allowed = d.get('role'), d.get('module'), 1 if d.get('allowed') else 0
+    if role_ not in ('Admin', 'Member') or mod not in [m[0] for m in ACCESS_MODULES]:
+        return jsonify(ok=False), 400
+    conn = sqlite3.connect(DB_NAME)
+    conn.execute("INSERT INTO access_control (role, module, allowed) VALUES (?,?,?) ON CONFLICT(role, module) DO UPDATE SET allowed=excluded.allowed", (role_, mod, allowed))
+    conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)", (f"Access control: {role_} -> {mod} {'enabled' if allowed else 'disabled'}", actor_name()))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.route('/access/reset', methods=['POST'])
+def access_reset():
+    if not session.get('logged_in') or session.get('role') != 'HR':
+        return jsonify(ok=False), 403
+    conn = sqlite3.connect(DB_NAME)
+    conn.execute("DELETE FROM access_control")
+    conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)", ("Access control reset to default", actor_name()))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.route('/fund/add', methods=['POST'])
+def fund_add():
+    if not session.get('logged_in') or session.get('role') != 'HR':
+        return redirect(url_for('login'))
+    kind = request.form.get('kind')
+    amount = to_int(request.form.get('amount'), 0)
+    note = (request.form.get('note') or '').strip()[:200]
+    if kind not in ('Deposit', 'Expense') or amount <= 0:
+        return redirect(url_for('dashboard', tab='settings', section='fund', success_msg='Invalid fund entry.'))
+    conn = sqlite3.connect(DB_NAME)
+    if kind == 'Expense' and amount > fund_total(conn):
+        conn.close()
+        return redirect(url_for('dashboard', tab='settings', section='fund', success_msg='Not enough balance in the fund.'))
+    conn.execute("INSERT INTO fund_transactions (kind, amount, note, created_by) VALUES (?,?,?,?)", (kind, amount, note, actor_name()))
+    conn.execute("INSERT INTO activity_logs (action, actor) VALUES (?, ?)", (f"Fund {'added' if kind == 'Deposit' else 'spent'}: {amount}" + (f" ({note})" if note else ''), actor_name()))
+    conn.commit()
+    conn.close()
+    return redirect(url_for('dashboard', tab='settings', section='fund', success_msg='Fund updated successfully.'))
 
 
 @app.route('/save_theme', methods=['POST'])
@@ -3827,13 +3858,3 @@ if __name__ == '__main__':
     # debug=True with host 0.0.0.0 exposes the Werkzeug debugger to the network.
     # Development-e chalate: set FLASK_DEBUG=1
     app.run(host='0.0.0.0', port=5000, debug=os.environ.get('FLASK_DEBUG') == '1')
-            phone TEXT,
-            password_hash TEXT,
-            target_user_id INTEGER,
-            otp TEXT NOT NULL,
-            expires_at TEXT NOT NULL,
-            attempts INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'pending',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
